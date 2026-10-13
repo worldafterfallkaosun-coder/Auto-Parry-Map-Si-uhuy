@@ -381,9 +381,28 @@ local Parry = {
 }
 
 -- ============================================================
+--  LOCK CONFIG
+-- ============================================================
+local LockCFG = {
+    Range          = 25,
+    LeashRange     = 30,
+    LockDuration   = 60,
+    SwitchCooldown = 0.8,
+    PredictFactor  = 0.12,
+    Responsiveness = 40,
+    MaxTorque      = 1e6,
+    ProxRange      = 12,
+    BlockedStates  = {
+        "IsKO","IsBeingCarried","IsCarrying","IsStunned","IsGrabbing",
+        "IsBeingGrabbed","IsHitFrozen","IsFinishing","IsBeingFinished",
+        "IsActionLocked","IsWakingUp","IsDodging","IsVaulting","IsSliding","IsClashing",
+    },
+}
+
+-- ============================================================
 --  LOCK STATE
---  v6: lock ONLY activates on combat event (self-attack or
---  self-damage). Neutral play = no constraint, no camera touch.
+--  Lock aktif HANYA saat combat event (ngehit / kena hit).
+--  Neutral = no constraint, kamera default Roblox.
 -- ============================================================
 local ATT_NAME = RandName(10)
 local AO_NAME  = RandName(10)
@@ -393,13 +412,22 @@ local Lock = {
     target      = nil,
     expireTime  = 0,
     combatTime  = 0,
-    inCombat    = false,   -- true only during/after hit exchange
+    inCombat    = false,   -- true only saat hit exchange
     alignOri    = nil,
     att0        = nil,
     camTargetCF = nil,
+    -- velocity state
+    prevPos     = nil,
+    vel         = Vector3.zero,
+    lastVelT    = 0,
+    -- switch / prox state
+    lastSwitch  = 0,
+    lastProx    = 0,
+    isAtk       = false,
+    candidates  = {},
 }
 
--- Hysteresis: new target must outscore current by 25 in v6
+-- Hysteresis: new target must outscore current by 25
 local LOCK_SWITCH_HYSTERESIS = 25
 
 -- ============================================================
@@ -1241,12 +1269,13 @@ local function HookSelf(char)
     if not char then return end
     local hum = char:FindFirstChildWhichIsA("Humanoid")
 
+    -- ngehit: MarkCombat + selalu acquire target (bukan cuma kalau kosong)
     for _, attr in ipairs(SELF_ATKS) do
         pcall(function()
             char:GetAttributeChangedSignal(attr):Connect(function()
                 if char:GetAttribute(attr) == true then
                     MarkCombat()
-                    if Lock.on and (not Lock.target or not ValidTarget(Lock.target)) then
+                    if Lock.on then
                         local best = GetBestTarget(true)
                         if best then LockOn(best) end
                     end
@@ -1259,9 +1288,9 @@ local function HookSelf(char)
         local prevHP = hum.Health
         hum:GetPropertyChangedSignal("Health"):Connect(function()
             if hum.Health < prevHP then
+                -- kena hit: MarkCombat + re-acquire closest enemy
                 MarkCombat()
                 if Lock.on then
-                    -- SwitchOnHit: on damage, re-acquire closest enemy (v14)
                     local now = os.clock()
                     if now - Lock.lastSwitch >= LockCFG.SwitchCooldown then
                         Lock.lastSwitch = now
@@ -1278,7 +1307,7 @@ local function HookSelf(char)
                             end
                         end
                         if closest then LockOn(closest)
-                        elseif not Lock.target then
+                        else
                             local b = GetBestTarget(true); if b then LockOn(b) end
                         end
                     end
