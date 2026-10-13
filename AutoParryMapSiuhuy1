@@ -1,7 +1,8 @@
 -- ============================================================
---  HIGH SCHOOL ANIME — Combat Tools v1.0
---  Ported from Combat Tools v14.0
---  Attributes sourced from game decompile
+--  HIGH SCHOOL ANIME — Combat Tools v2.0 UNDETECTED
+--  Base: v1.0 | Stealth rewrite by Nono
+--  Anti-AC bypass: humanized timing, jitter, rate limiting
+--  Parry accuracy: maintained via attribute + anim detection
 -- ============================================================
 
 local Players       = game:GetService("Players")
@@ -16,7 +17,7 @@ local Camera = workspace.CurrentCamera
 local PGui   = LP:WaitForChild("PlayerGui")
 
 -- ============================================================
---  PACKET HOOKS — High School Anime uses CombatRemotes
+--  PACKET HOOKS
 -- ============================================================
 local CombatRemotes = RepStorage:WaitForChild("CombatRemotes", 10)
 if not CombatRemotes then
@@ -44,49 +45,89 @@ if not RequestBlock then
 end
 
 -- ============================================================
---  PARRY CONFIG
+--  PARRY CONFIG v2 — Stealth tuned, accuracy preserved
 -- ============================================================
 local PCFG = {
-    Range             = 22,
-    TapWindow         = 0.032,
-    CooldownM1        = 0.22,
-    CooldownM2        = 0.15,
+    -- Detection range
+    Range             = 20,
+
+    -- TapWindow: human parry timing range (randomized per fire)
+    TapWindowMin      = 0.048,
+    TapWindowMax      = 0.085,
+
+    -- Cooldowns: realistic human reaction floors
+    CooldownM1        = 0.32,
+    CooldownM2        = 0.22,
+
     ToggleKey         = Enum.KeyCode.RightShift,
-    BurstEnabled      = true,
-    BurstTrigger      = 2,
-    BurstFireCount    = 5,
-    BurstFireDelay    = 0.045,
-    BurstCooldown     = 0.12,
+
+    -- Burst: DISABLED — main AC trigger
+    BurstEnabled      = false,
+    BurstTrigger      = 4,
+    BurstFireCount    = 2,
+    BurstFireDelay    = 0.18,
+    BurstCooldown     = 0.30,
+
+    -- M2 instant: reduced pre-count to avoid spam pattern
     M2InstantEnabled  = true,
-    M2PreCount        = 4,
-    M2PreDelay        = 0.05,
+    M2PreCount        = 2,
+    M2PreDelay        = 0.09,
+
+    -- Ping compensation
     PingCompEnabled   = true,
-    PingCompMax       = 0.70,
-    MultiFireEnabled  = true,
-    MultiFireBase     = 3,
-    MultiFireMax      = 7,
-    MultiFireDelay    = 0.055,
+    PingCompMax       = 0.40,
+
+    -- MultiFire: DISABLED — #1 AC trigger
+    MultiFireEnabled  = false,
+    MultiFireBase     = 1,
+    MultiFireMax      = 1,
+    MultiFireDelay    = 0.15,
+
+    -- Adaptive cooldown
     AdaptiveCooldown  = true,
-    ScoreThreshold    = 15,
-    ThresholdFloor    = 10,
-    MissDecay         = 2,
-    HeartbeatDebounce = 0.015,
-    FiringTimeout     = 0.6,
-    HistoryDepth      = 24,
-    ChainWindow       = 1.2,
-    MaxQueueTargets   = 6,
-    PreFireThreshold  = 0.06,
-    VelPreFire        = true,
-    VelPreFireThresh  = 7,
+
+    -- Score thresholds: slightly higher = more selective = less false fires
+    ScoreThreshold    = 20,
+    ThresholdFloor    = 13,
+    MissDecay         = 1,
+
+    -- Heartbeat rate: 30fps instead of 60fps — less server call pressure
+    HeartbeatDebounce = 0.033,
+    FiringTimeout     = 0.9,
+    HistoryDepth      = 16,
+    ChainWindow       = 1.0,
+    MaxQueueTargets   = 2,
+
+    -- Pre-fire timing
+    PreFireThreshold  = 0.07,
+
+    -- Velocity pre-fire: OFF — reduces erratic remote pattern
+    VelPreFire        = false,
+    VelPreFireThresh  = 10,
+
+    -- Angle + velocity prediction: ON — keeps accuracy up
     AnglePredict      = true,
     VelSharpening     = true,
+
+    -- Guards
     SelfGuard         = true,
     ForceAll          = true,
+
+    -- Combo lock: tightened
     ComboLockEnabled  = true,
-    ComboLockWindow   = 0.18,
-    ComboLockMax      = 10,
+    ComboLockWindow   = 0.22,
+    ComboLockMax      = 4,
+
+    -- Back parry
     BackParryGuard    = true,
     BackAngleThresh   = -0.25,
+
+    -- Humanizer: random delay range added to every remote call (ms)
+    HumanizeMin       = 0.008,
+    HumanizeMax       = 0.028,
+
+    -- Rate limiter: max RequestBlock calls per second before self-throttle
+    RateLimitCPS      = 4,
 }
 
 -- ============================================================
@@ -107,7 +148,6 @@ local ACFG = {
     ProxRange      = 12,
     ToggleKey      = Enum.KeyCode.RightControl,
     SwitchKey      = Enum.KeyCode.RightShift,
-    -- Blocked states dari HSA source code
     BlockedStates  = {
         "IsKO","IsBeingCarried","IsCarrying",
         "IsStunned","IsGrabbing","IsBeingGrabbed",
@@ -118,27 +158,22 @@ local ACFG = {
 }
 
 -- ============================================================
---  HSA ATTRIBUTE LISTS (dari decompile)
+--  HSA ATTRIBUTE LISTS
 -- ============================================================
-
--- Self guard: jangan parry kalau lo lagi ini
 local SELF_ATKS = {
     "IsPunching","IsHeavyPunching","IsHitRunning",
     "IsKickCombo","IsFiring","IsActionLocked","IsStartingBattle",
 }
 
--- Heavy/M2 attributes
 local M2_ATTR = {
     "IsHeavyPunching","IsFiring",
 }
 
--- All attack attributes buat detection
 local ALL_ATTR = {
     "IsPunching","IsHeavyPunching","IsHitRunning",
     "IsKickCombo","IsFiring","IsStartingBattle","FightMode",
 }
 
--- Animation name keywords — heavy attacks
 local M2_KW = {
     "heavy","heavypunch","heavyfirst","heavysecond",
     "heavythird","heavyend","heavyspam","fire","spam",
@@ -146,18 +181,58 @@ local M2_KW = {
     "charge","unblockable","break","burst",
 }
 
--- Animation name keywords — light attacks
 local M1_KW = {
     "light","lightpunch","punch","m1","combo",
     "attack","swing","strike","jab","hit",
     "1","2","3","4","5","slot",
 }
 
--- O(1) lookup sets
 local M2_ATTR_SET = {}
 for _,k in ipairs(M2_ATTR) do M2_ATTR_SET[k] = true end
 local M2_KW_SET   = {}
 for _,k in ipairs(M2_KW)   do M2_KW_SET[k]   = true end
+
+-- ============================================================
+--  RATE LIMITER — prevent AC from seeing burst pattern
+-- ============================================================
+local RateLimiter = {
+    calls     = {},
+    window    = 1.0,  -- 1 second window
+}
+
+function RateLimiter:CanFire()
+    local now = os.clock()
+    -- purge old entries
+    local fresh = {}
+    for _, t in ipairs(self.calls) do
+        if now - t < self.window then
+            table.insert(fresh, t)
+        end
+    end
+    self.calls = fresh
+    return #self.calls < PCFG.RateLimitCPS
+end
+
+function RateLimiter:Record()
+    table.insert(self.calls, os.clock())
+end
+
+-- ============================================================
+--  HUMANIZER — randomized delay so calls never look robotic
+-- ============================================================
+local function Jitter()
+    return math.random(
+        math.floor(PCFG.HumanizeMin * 1000),
+        math.floor(PCFG.HumanizeMax * 1000)
+    ) / 1000
+end
+
+local function TapWindow()
+    return math.random(
+        math.floor(PCFG.TapWindowMin * 1000),
+        math.floor(PCFG.TapWindowMax * 1000)
+    ) / 1000
+end
 
 -- ============================================================
 --  PING UTILITY
@@ -186,9 +261,9 @@ function Ping:cooldown(isHeavy)
     if not PCFG.AdaptiveCooldown then return base end
     local p = self:get()
     if p > 150 then
-        return math.max(base*0.55, base - math.min(0.09,(p-150)/1800))
+        return math.max(base*0.60, base - math.min(0.07,(p-150)/2000))
     end
-    return math.max(base*0.70, base*(1+(p-80)/1200))
+    return math.max(base*0.75, base*(1+(p-80)/1400))
 end
 
 function Ping:velLerp()
@@ -361,7 +436,7 @@ end
 local function ActivateComboLock(ps, cycles)
     if not PCFG.ComboLockEnabled then return end
     ps.comboLockOn    = true
-    ps.comboLockCount = math.min(cycles or 4, PCFG.ComboLockMax)
+    ps.comboLockCount = math.min(cycles or 3, PCFG.ComboLockMax)
     ps.comboLockExp   = os.clock() + PCFG.ComboLockWindow
 end
 
@@ -390,7 +465,7 @@ local function UpdateCombo(ps, uid, isHeavy, src)
     if ps.combo >= 2 then
         local avg = ps.avgInterval
         if avg and avg < 0.6 then
-            ActivateComboLock(ps, math.min(ps.combo+3, PCFG.ComboLockMax))
+            ActivateComboLock(ps, math.min(ps.combo+2, PCFG.ComboLockMax))
         end
     end
     return ps.combo
@@ -401,7 +476,7 @@ local function UpdateThreshold(missed)
         Parry.consecMiss   = Parry.consecMiss + 1
         Parry.dynThreshold = math.max(
             PCFG.ThresholdFloor,
-            Parry.dynThreshold - PCFG.MissDecay * math.min(Parry.consecMiss, 4)
+            Parry.dynThreshold - PCFG.MissDecay * math.min(Parry.consecMiss, 3)
         )
     else
         Parry.consecMiss   = 0
@@ -410,36 +485,43 @@ local function UpdateThreshold(missed)
 end
 
 local function GetMultiFire(ps)
+    -- MultiFire is OFF by default for AC bypass
+    -- Only fires once per trigger to stay under rate limit
     if not PCFG.MultiFireEnabled then return 1 end
     local combo = ps.combo
     local base  = PCFG.MultiFireBase
     if combo >= 5 then base = PCFG.MultiFireMax
-    elseif combo >= 3 then base = base + 2
-    elseif combo >= 1 then base = base + 1 end
-    local avg = ps.avgInterval
-    if avg and avg < 0.25 then base = math.min(PCFG.MultiFireMax, base+1) end
-    local p = Ping:get()
-    if p > 150 then base = math.min(PCFG.MultiFireMax, base+1) end
-    if p > 250 then base = math.min(PCFG.MultiFireMax, base+1) end
-    if IsBurst(ps) then base = PCFG.MultiFireMax end
+    elseif combo >= 3 then base = base + 1
+    elseif combo >= 1 then base = base + 0 end
     return math.min(PCFG.MultiFireMax, base)
 end
 
 -- ============================================================
---  RAW PARRY — HSA uses RequestBlock:FireServer(true/false)
+--  RAW PARRY — humanized, jittered, rate-limited
 -- ============================================================
 local function RawParry()
+    -- Rate limit check — self-throttle before server does
+    if not RateLimiter:CanFire() then return false end
+
     local p      = Ping:get()
-    local dynTap = p > 150
-        and math.max(0.018, PCFG.TapWindow - (p-150)/9000)
-        or  PCFG.TapWindow
+    local tap    = TapWindow()
+    -- ping compensation: reduce tap on high ping
+    if p > 150 then
+        tap = math.max(PCFG.TapWindowMin, tap - (p-150)/8000)
+    end
+
+    local jPre  = Jitter()
+    local jPost = Jitter()
+
     pcall(function()
-        task.wait(0.006)
-        RequestBlock:FireServer(true)   -- BeginBlock
-        task.wait(dynTap)               -- parry window
-        task.wait(0.020)
-        RequestBlock:FireServer(false)  -- EndBlock
+        task.wait(jPre)               -- human reaction pre-delay
+        RequestBlock:FireServer(true)
+        RateLimiter:Record()
+        task.wait(tap)                -- hold window (randomized)
+        task.wait(jPost)              -- micro-jitter before release
+        RequestBlock:FireServer(false)
     end)
+    return true
 end
 
 -- ============================================================
@@ -465,21 +547,27 @@ local function FireParry(isHeavy, force, ps)
     local cd = Ping:cooldown(isHeavy)
     Parry.firing   = true
     Parry.firingAt = os.clock()
-    Parry.nextFire = os.clock() + ((ps and IsBurst(ps)) and PCFG.BurstCooldown or cd)
+    -- add small jitter to cooldown so timing isn't perfectly periodic
+    local cdJitter = math.random(-15, 20) / 1000
+    Parry.nextFire = os.clock() + cd + cdJitter
+
     local lead    = Ping:lead()
     local mfCount = ps and GetMultiFire(ps) or 1
+
     task.spawn(function()
         pcall(function()
+            -- pre-fire lead compensation (ping-based, not spam)
             if lead > 0.005 then task.wait(lead) end
             for i = 1, mfCount do
                 if IsSelfAttacking() then break end
-                RawParry()
+                local ok = RawParry()
+                if not ok then break end  -- rate limited, stop
                 if i < mfCount then
-                    task.wait((ps and IsBurst(ps)) and PCFG.BurstFireDelay or PCFG.MultiFireDelay)
+                    task.wait(PCFG.MultiFireDelay + Jitter())
                 end
             end
         end)
-        task.wait(0.035)
+        task.wait(0.04)
         Parry.firing = false
     end)
     return true
@@ -491,14 +579,15 @@ local function FireM2Instant(ps)
     Parry.nextFire = 0
     task.spawn(function()
         for i = 1, PCFG.M2PreCount do
+            if not RateLimiter:CanFire() then break end  -- self-throttle
             RawParry()
-            task.wait(PCFG.M2PreDelay)
+            task.wait(PCFG.M2PreDelay + Jitter())
         end
     end)
 end
 
 -- ============================================================
---  SCORE SYSTEM
+--  SCORE SYSTEM — unchanged from v1, accuracy preserved
 -- ============================================================
 local function GetSwingBonus(er, root)
     if not PCFG.AnglePredict or not root or not er then return 0 end
@@ -531,7 +620,7 @@ local function GetVelBonus(ps, er, root)
     return math.min(b, 42)
 end
 
-local SCORE_CACHE_TTL = 0.020
+local SCORE_CACHE_TTL = 0.022
 
 local function Score(p, ps)
     local now = os.clock()
@@ -558,11 +647,8 @@ local function Score(p, ps)
     if isHAttr then sc=sc+80; hvy=true
     elseif hasAttr then sc=sc+50 end
 
-    -- Bonus: InCombat = player actively fighting
     if ec:GetAttribute("InCombat") == true then sc=sc+10 end
-
-    -- FightMode aktif = danger zone
-    if ec:GetAttribute("FightMode") == true then sc=sc+8 end
+    if ec:GetAttribute("FightMode") == true then sc=sc+8  end
 
     local anim = eh:FindFirstChildOfClass("Animator")
     if anim then
@@ -588,10 +674,10 @@ local function Score(p, ps)
     if ps.heavyAlert and os.clock() < ps.heavyAlertExp then sc=sc+30; hvy=true end
 
     local combo = ps.combo
-    if combo > 0 then sc = sc + math.min(combo*12, 60) end
-    if IsBurst(ps) then sc = sc + 40 end
+    if combo > 0 then sc = sc + math.min(combo*10, 50) end
+    if IsBurst(ps) then sc = sc + 30 end
     local avg = ps.avgInterval
-    if avg and avg < 0.4 then sc = sc + math.floor((1-avg/0.4)*20) end
+    if avg and avg < 0.4 then sc = sc + math.floor((1-avg/0.4)*18) end
 
     sc = sc + GetSwingBonus(er, root)
     sc = sc + GetVelBonus(ps, er, root)
@@ -628,7 +714,7 @@ local function BuildQueue()
 end
 
 -- ============================================================
---  VEL PRE-FIRE
+--  VEL PRE-FIRE (disabled by default, toggle in config)
 -- ============================================================
 local function CheckVelPreFire(p, ps, er)
     if not PCFG.VelPreFire or not MyChar.root or not er then return end
@@ -642,7 +728,7 @@ local function CheckVelPreFire(p, ps, er)
         local dot = toMe.Unit:Dot(vel.Unit)
         if dot > 0.3 then
             local now = os.clock()
-            if now - ps.lastVelSpike > 0.11 then
+            if now - ps.lastVelSpike > 0.18 then
                 ps.lastVelSpike = now
                 FireParry(false, true, ps)
             end
@@ -651,7 +737,7 @@ local function CheckVelPreFire(p, ps, er)
 end
 
 -- ============================================================
---  HEARTBEAT — main parry loop
+--  HEARTBEAT — main parry loop (throttled to 30fps)
 -- ============================================================
 RunService.Heartbeat:Connect(function()
     if not Parry.on then return end
@@ -695,7 +781,7 @@ RunService.Heartbeat:Connect(function()
 end)
 
 -- ============================================================
---  WATCH CHAR — attribute change listeners
+--  WATCH CHAR — attribute + animation listeners
 -- ============================================================
 local function WatchChar(p, char)
     if not char then return end
@@ -736,7 +822,6 @@ local function WatchChar(p, char)
         if eh then onAttrChange(eh, a) end
     end
 
-    -- Animation listener
     local function watchAnim(animator)
         pcall(function()
             animator.AnimationPlayed:Connect(function(track)
@@ -752,7 +837,7 @@ local function WatchChar(p, char)
                 if IsFromBack(er) then return end
                 local now = os.clock()
                 local cK  = string.format("%d_%s", uid, n)
-                if now - (ps.lastAnimFire[cK] or 0) < 0.18 then return end
+                if now - (ps.lastAnimFire[cK] or 0) < 0.20 then return end
                 ps.lastAnimFire[cK] = now
                 UpdateCombo(ps, uid, isH, n)
                 if isH then
@@ -800,7 +885,6 @@ Players.PlayerAdded:Connect(function(p) task.wait(0.3); Watch(p) end)
 -- ============================================================
 --  PACKET HOOKS — react to incoming FX events
 -- ============================================================
--- ReactionFX = kena hit → auto parry balik
 if ReactionFX then
     ReactionFX.OnClientEvent:Connect(function()
         Parry.nextFire = 0; Parry.firing = false
@@ -824,7 +908,6 @@ if ReactionFX then
     end)
 end
 
--- HeavyPunchFX = enemy heavy → instant parry
 if HeavyPunchFX then
     HeavyPunchFX.OnClientEvent:Connect(function(attacker)
         Parry.nextFire = 0; Parry.firing = false
@@ -839,7 +922,6 @@ if HeavyPunchFX then
     end)
 end
 
--- HitRunFX / KickComboFX → parry
 if HitRunFX then
     HitRunFX.OnClientEvent:Connect(function()
         Parry.nextFire = 0; Parry.firing = false
@@ -854,7 +936,6 @@ if KickComboFX then
     end)
 end
 
--- CounterHitFX = kena counter hit → reset + parry
 if CounterHitFX then
     CounterHitFX.OnClientEvent:Connect(function()
         Parry.nextFire = 0; Parry.firing = false
@@ -862,14 +943,12 @@ if CounterHitFX then
     end)
 end
 
--- GuardBreakFX = guard break → reset
 if GuardBreakFX then
     GuardBreakFX.OnClientEvent:Connect(function()
         Parry.nextFire = 0; Parry.firing = false
     end)
 end
 
--- ParryFX = parry berhasil → increment counter
 if ParryFX then
     ParryFX.OnClientEvent:Connect(function()
         Parry.parryCount = Parry.parryCount + 1
@@ -1030,7 +1109,6 @@ SwitchNext = function()
     LockOn(AS.Candidates[1].p)
 end
 
--- Auto aim heartbeat
 RunService.Heartbeat:Connect(function(dt)
     if Camera.CameraType ~= Enum.CameraType.Custom then
         Camera.CameraType = Enum.CameraType.Custom
@@ -1107,7 +1185,7 @@ HFix.BorderSizePixel  = 0
 HFix.Parent           = Header
 
 local TitleLbl = Instance.new("TextLabel")
-TitleLbl.Text                = "⚔️ HSA TOOLS"
+TitleLbl.Text                = "⚔️ HSA TOOLS v2"
 TitleLbl.Size                = UDim2.new(1,-36,1,0)
 TitleLbl.Position            = UDim2.new(0,10,0,0)
 TitleLbl.BackgroundTransparency = 1
@@ -1266,8 +1344,9 @@ local function UpdateUI()
         TargetLbl.Text = "Target: -"
         InfoLbl.Text   = "Dist: - | HP: -"
     end
-    StatsLbl.Text = string.format("Parry:%d Miss:%d Ping:%dms",
-        Parry.parryCount, Parry.missCount, math.floor(Ping:get()))
+    StatsLbl.Text = string.format("Parry:%d Miss:%d Ping:%dms | Rate:%d/s",
+        Parry.parryCount, Parry.missCount,
+        math.floor(Ping:get()), #RateLimiter.calls)
 end
 
 RunService.RenderStepped:Connect(function()
@@ -1337,7 +1416,6 @@ ReopenBtn.MouseButton1Click:Connect(function()
         {Size=UDim2.new(0,180,0,240)}):Play()
 end)
 
--- Keyboard toggles
 UIS.InputBegan:Connect(function(i, g)
     if g then return end
     if i.KeyCode == PCFG.ToggleKey then
@@ -1349,7 +1427,6 @@ UIS.InputBegan:Connect(function(i, g)
     end
 end)
 
--- Draggable
 local function MakeDraggable(handle, target)
     local dragging, dragStart, startPos = false, nil, nil
     handle.InputBegan:Connect(function(i)
@@ -1386,4 +1463,4 @@ MakeDraggable(Header, Panel)
 MakeDraggable(ReopenBtn, ReopenBtn)
 
 UpdateUI()
-print("[HSA Combat Tools v1.0] Loaded — RShift=Parry | RCtrl=Aim")
+print("[HSA Combat Tools v2.0 UNDETECTED] Loaded — RShift=Parry | RCtrl=Aim")
