@@ -1,35 +1,29 @@
 -- ============================================================
---  HIGH SCHOOL ANIME — Combat Tools v2.0 UNDETECTED
---  Base: v1.0 | Stealth rewrite by Nono
---  Anti-AC bypass: humanized timing, jitter, rate limiting
---  Parry accuracy: maintained via attribute + anim detection
+--  HIGH SCHOOL ANIME — Combat Tools v3.0
+--  PERFECT PARRY + SMART COMBAT LOCK
+--  - Zero-miss: spam block pattern on every threat
+--  - Lock: auto engage on hit/get-hit, neutral when idle
+--  - AC bypass: humanized jitter, rate limiter
 -- ============================================================
 
-local Players       = game:GetService("Players")
-local RunService    = game:GetService("RunService")
-local UIS           = game:GetService("UserInputService")
-local Stats         = game:GetService("Stats")
-local TweenService  = game:GetService("TweenService")
-local RepStorage    = game:GetService("ReplicatedStorage")
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local UIS          = game:GetService("UserInputService")
+local Stats        = game:GetService("Stats")
+local TweenService = game:GetService("TweenService")
+local RepStorage   = game:GetService("ReplicatedStorage")
 
 local LP     = Players.LocalPlayer
 local Camera = workspace.CurrentCamera
 local PGui   = LP:WaitForChild("PlayerGui")
 
 -- ============================================================
---  PACKET HOOKS
+--  REMOTE HOOKS
 -- ============================================================
 local CombatRemotes = RepStorage:WaitForChild("CombatRemotes", 10)
-if not CombatRemotes then
-    warn("[HSA Combat] CombatRemotes not found — aborting.")
-    return
-end
+if not CombatRemotes then warn("[HSA] CombatRemotes missing"); return end
 
 local RequestBlock     = CombatRemotes:WaitForChild("RequestBlock", 5)
-local RequestHit       = CombatRemotes:WaitForChild("RequestHit", 5)
-local RequestHeavy     = CombatRemotes:WaitForChild("RequestHeavyPunch", 5)
-local RequestPunch     = CombatRemotes:WaitForChild("RequestPunch", 5)
-local RequestFightMode = CombatRemotes:WaitForChild("RequestFightMode", 5)
 local ReactionFX       = CombatRemotes:WaitForChild("ReactionFX", 5)
 local ParryFX          = CombatRemotes:WaitForChild("ParryFX", 5)
 local CounterHitFX     = CombatRemotes:WaitForChild("CounterHitFX", 5)
@@ -39,122 +33,81 @@ local KickComboFX      = CombatRemotes:WaitForChild("KickComboFX", 5)
 local HeavyPunchFX     = CombatRemotes:WaitForChild("HeavyPunchFX", 5)
 local KOFX             = CombatRemotes:WaitForChild("KOFX", 5)
 
-if not RequestBlock then
-    warn("[HSA Combat] RequestBlock not found — parry won't work.")
-    return
-end
+if not RequestBlock then warn("[HSA] RequestBlock missing"); return end
 
 -- ============================================================
---  PARRY CONFIG v2 — Stealth tuned, accuracy preserved
+--  CONFIG
 -- ============================================================
-local PCFG = {
-    -- Detection range
-    Range             = 20,
+local CFG = {
+    -- === PARRY CORE ===
+    ParryRange        = 22,
+    -- Spam block: fires N times per trigger to guarantee parry window hit
+    -- This is the key — spam like manual block spam, guaranteed connect
+    SpamCount         = 4,       -- fires per trigger (like manual spam)
+    SpamInterval      = 0.055,   -- gap between each spam fire
+    TapMin            = 0.040,   -- hold window min
+    TapMax            = 0.075,   -- hold window max (randomized)
+    CooldownM1        = 0.28,    -- cooldown after light parry
+    CooldownM2        = 0.18,    -- cooldown after heavy parry
+    -- Pre-fire: fire slightly before detection confirms (prediction)
+    PreFireLead       = true,
+    PreFireMs         = 0.025,   -- how early to pre-fire
 
-    -- TapWindow: human parry timing range (randomized per fire)
-    TapWindowMin      = 0.048,
-    TapWindowMax      = 0.085,
-
-    -- Cooldowns: realistic human reaction floors
-    CooldownM1        = 0.32,
-    CooldownM2        = 0.22,
-
-    ToggleKey         = Enum.KeyCode.RightShift,
-
-    -- Burst: DISABLED — main AC trigger
-    BurstEnabled      = false,
-    BurstTrigger      = 4,
-    BurstFireCount    = 2,
-    BurstFireDelay    = 0.18,
-    BurstCooldown     = 0.30,
-
-    -- M2 instant: reduced pre-count to avoid spam pattern
-    M2InstantEnabled  = true,
-    M2PreCount        = 2,
-    M2PreDelay        = 0.09,
-
-    -- Ping compensation
-    PingCompEnabled   = true,
-    PingCompMax       = 0.40,
-
-    -- MultiFire: DISABLED — #1 AC trigger
-    MultiFireEnabled  = false,
-    MultiFireBase     = 1,
-    MultiFireMax      = 1,
-    MultiFireDelay    = 0.15,
-
-    -- Adaptive cooldown
-    AdaptiveCooldown  = true,
-
-    -- Score thresholds: slightly higher = more selective = less false fires
-    ScoreThreshold    = 20,
-    ThresholdFloor    = 13,
+    -- === SCORE / THRESHOLD ===
+    -- Low threshold = fire on ANY nearby threat, never miss
+    ScoreThreshold    = 8,
+    ThresholdFloor    = 5,
     MissDecay         = 1,
+    ScoreMax          = 140,
 
-    -- Heartbeat rate: 30fps instead of 60fps — less server call pressure
-    HeartbeatDebounce = 0.033,
-    FiringTimeout     = 0.9,
-    HistoryDepth      = 16,
-    ChainWindow       = 1.0,
-    MaxQueueTargets   = 2,
+    -- === REACTION SPEED ===
+    HeartbeatRate     = 0.012,   -- scan rate (fast but AC-safe via rate limiter)
+    FiringTimeout     = 0.5,
+    HistoryDepth      = 20,
+    ChainWindow       = 1.2,
+    MaxQueueTargets   = 3,
 
-    -- Pre-fire timing
-    PreFireThreshold  = 0.07,
-
-    -- Velocity pre-fire: OFF — reduces erratic remote pattern
-    VelPreFire        = false,
-    VelPreFireThresh  = 10,
-
-    -- Angle + velocity prediction: ON — keeps accuracy up
+    -- === PREDICTION ===
     AnglePredict      = true,
     VelSharpening     = true,
+    VelPreFire        = true,    -- velocity spike pre-fire ON
+    VelPreFireThresh  = 6,
 
-    -- Guards
-    SelfGuard         = true,
-    ForceAll          = true,
-
-    -- Combo lock: tightened
-    ComboLockEnabled  = true,
-    ComboLockWindow   = 0.22,
-    ComboLockMax      = 4,
-
-    -- Back parry
+    -- === BACK GUARD ===
     BackParryGuard    = true,
-    BackAngleThresh   = -0.25,
+    BackAngleThresh   = -0.20,
 
-    -- Humanizer: random delay range added to every remote call (ms)
-    HumanizeMin       = 0.008,
-    HumanizeMax       = 0.028,
+    -- === SELF GUARD ===
+    SelfGuard         = true,
 
-    -- Rate limiter: max RequestBlock calls per second before self-throttle
-    RateLimitCPS      = 4,
-}
+    -- === PING COMP ===
+    PingCompEnabled   = true,
+    PingCompMax       = 0.50,
 
--- ============================================================
---  AUTO AIM CONFIG
--- ============================================================
-local ACFG = {
-    ON             = false,
-    Range          = 25,
-    LeashRange     = 30,
-    LockDuration   = 60,
-    NoAutoSwitch   = true,
-    SwitchOnHit    = true,
-    SwitchCooldown = 0.8,
-    PredictFactor  = 0.12,
-    VelLerpBase    = 0.35,
-    Responsiveness = 40,
-    MaxTorque      = 1e6,
-    ProxRange      = 12,
-    ToggleKey      = Enum.KeyCode.RightControl,
-    SwitchKey      = Enum.KeyCode.RightShift,
-    BlockedStates  = {
-        "IsKO","IsBeingCarried","IsCarrying",
-        "IsStunned","IsGrabbing","IsBeingGrabbed",
-        "IsHitFrozen","IsFinishing","IsBeingFinished",
-        "IsActionLocked","IsWakingUp","IsDodging",
-        "IsVaulting","IsSliding","IsClashing",
-    },
+    -- === HUMANIZER (AC bypass) ===
+    -- Jitter on every remote call so pattern isn't robotic
+    JitterMin         = 6,       -- ms
+    JitterMax         = 22,      -- ms
+    -- Rate limiter: max block calls/sec before self-throttle
+    -- Set high enough to allow spam count but still under AC radar
+    RateLimitCPS      = 14,
+
+    -- === SMART LOCK ===
+    -- Lock activates automatically when: you hit someone, or someone hits you
+    -- Lock deactivates automatically when: you stop attacking AND stop getting hit
+    -- Neutral timeout: seconds of no combat before unlock
+    LockRange         = 28,
+    LockLeash         = 35,
+    LockDuration      = 60,
+    NeutralTimeout    = 3.5,     -- seconds idle before auto-unlock
+    LockPredictFactor = 0.12,
+    LockVelLerpBase   = 0.35,
+    LockResponsive    = 40,
+    LockMaxTorque     = 1e6,
+    LockToggleKey     = Enum.KeyCode.RightControl,
+
+    -- === PARRY TOGGLE ===
+    ParryToggleKey    = Enum.KeyCode.RightShift,
 }
 
 -- ============================================================
@@ -164,168 +117,134 @@ local SELF_ATKS = {
     "IsPunching","IsHeavyPunching","IsHitRunning",
     "IsKickCombo","IsFiring","IsActionLocked","IsStartingBattle",
 }
-
-local M2_ATTR = {
-    "IsHeavyPunching","IsFiring",
-}
-
+local M2_ATTR = { "IsHeavyPunching","IsFiring" }
 local ALL_ATTR = {
     "IsPunching","IsHeavyPunching","IsHitRunning",
     "IsKickCombo","IsFiring","IsStartingBattle","FightMode",
 }
-
 local M2_KW = {
-    "heavy","heavypunch","heavyfirst","heavysecond",
-    "heavythird","heavyend","heavyspam","fire","spam",
-    "kickcombo","hitrun","kick","launch","slam","smash",
-    "charge","unblockable","break","burst",
+    "heavy","heavypunch","heavyfirst","heavysecond","heavythird",
+    "heavyend","heavyspam","fire","spam","kickcombo","hitrun",
+    "kick","launch","slam","smash","charge","unblockable","break","burst",
 }
-
 local M1_KW = {
-    "light","lightpunch","punch","m1","combo",
-    "attack","swing","strike","jab","hit",
-    "1","2","3","4","5","slot",
+    "light","lightpunch","punch","m1","combo","attack",
+    "swing","strike","jab","hit","1","2","3","4","5","slot",
 }
 
-local M2_ATTR_SET = {}
-for _,k in ipairs(M2_ATTR) do M2_ATTR_SET[k] = true end
-local M2_KW_SET   = {}
-for _,k in ipairs(M2_KW)   do M2_KW_SET[k]   = true end
+local M2_ATTR_SET = {}; for _,k in ipairs(M2_ATTR) do M2_ATTR_SET[k]=true end
+local M2_KW_SET   = {}; for _,k in ipairs(M2_KW)   do M2_KW_SET[k]=true   end
 
--- ============================================================
---  RATE LIMITER — prevent AC from seeing burst pattern
--- ============================================================
-local RateLimiter = {
-    calls     = {},
-    window    = 1.0,  -- 1 second window
+local LOCK_BLOCKED = {
+    "IsKO","IsBeingCarried","IsCarrying","IsStunned","IsGrabbing",
+    "IsBeingGrabbed","IsHitFrozen","IsFinishing","IsBeingFinished",
+    "IsActionLocked","IsWakingUp","IsDodging","IsVaulting","IsSliding","IsClashing",
 }
 
-function RateLimiter:CanFire()
+-- ============================================================
+--  RATE LIMITER
+-- ============================================================
+local RL = { calls = {} }
+function RL:ok()
     local now = os.clock()
-    -- purge old entries
     local fresh = {}
-    for _, t in ipairs(self.calls) do
-        if now - t < self.window then
-            table.insert(fresh, t)
-        end
+    for _,t in ipairs(self.calls) do
+        if now - t < 1.0 then table.insert(fresh,t) end
     end
     self.calls = fresh
-    return #self.calls < PCFG.RateLimitCPS
+    return #self.calls < CFG.RateLimitCPS
 end
-
-function RateLimiter:Record()
-    table.insert(self.calls, os.clock())
-end
+function RL:mark() table.insert(self.calls, os.clock()) end
 
 -- ============================================================
---  HUMANIZER — randomized delay so calls never look robotic
+--  HUMANIZER
 -- ============================================================
 local function Jitter()
-    return math.random(
-        math.floor(PCFG.HumanizeMin * 1000),
-        math.floor(PCFG.HumanizeMax * 1000)
-    ) / 1000
+    return math.random(CFG.JitterMin, CFG.JitterMax) / 1000
 end
-
 local function TapWindow()
     return math.random(
-        math.floor(PCFG.TapWindowMin * 1000),
-        math.floor(PCFG.TapWindowMax * 1000)
+        math.floor(CFG.TapMin*1000),
+        math.floor(CFG.TapMax*1000)
     ) / 1000
 end
 
 -- ============================================================
---  PING UTILITY
+--  PING
 -- ============================================================
-local Ping = {cache = 80, lastCheck = 0}
-
+local Ping = { cache=80, lastT=0 }
 function Ping:get()
     local now = os.clock()
-    if now - self.lastCheck > 0.25 then
-        local s,v = pcall(function()
+    if now - self.lastT > 0.25 then
+        local ok,v = pcall(function()
             return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
         end)
-        self.cache = (s and v) or self.cache
-        self.lastCheck = now
+        self.cache = (ok and v) or self.cache
+        self.lastT = now
     end
     return self.cache
 end
-
 function Ping:lead()
-    if not PCFG.PingCompEnabled then return 0 end
-    return math.min(PCFG.PingCompMax, (self:get()/1000)*3.2)
+    if not CFG.PingCompEnabled then return 0 end
+    return math.min(CFG.PingCompMax, (self:get()/1000)*3.0)
 end
-
-function Ping:cooldown(isHeavy)
-    local base = isHeavy and PCFG.CooldownM2 or PCFG.CooldownM1
-    if not PCFG.AdaptiveCooldown then return base end
+function Ping:cd(heavy)
+    local base = heavy and CFG.CooldownM2 or CFG.CooldownM1
     local p = self:get()
     if p > 150 then
-        return math.max(base*0.60, base - math.min(0.07,(p-150)/2000))
+        return math.max(base*0.55, base - math.min(0.07,(p-150)/2000))
     end
-    return math.max(base*0.75, base*(1+(p-80)/1400))
+    return math.max(base*0.70, base*(1+(p-80)/1400))
+end
+function Ping:vellerp()
+    return math.clamp(CFG.LockVelLerpBase - (self:get()-80)/2000, 0.12, 0.5)
 end
 
-function Ping:velLerp()
-    local p = self:get()
-    return math.clamp(ACFG.VelLerpBase - (p-80)/2000, 0.12, 0.5)
+-- ============================================================
+--  CHAR REF
+-- ============================================================
+local MC = { char=nil, hum=nil, root=nil }
+local function RefreshChar()
+    local c = LP.Character
+    if not c then MC.char=nil; MC.hum=nil; MC.root=nil; return false end
+    MC.char=c; MC.hum=c:FindFirstChildWhichIsA("Humanoid")
+    MC.root=c:FindFirstChild("HumanoidRootPart")
+    return MC.root~=nil
 end
+LP.CharacterAdded:Connect(function(c)
+    MC.char=c
+    MC.hum=c:WaitForChild("Humanoid")
+    MC.root=c:WaitForChild("HumanoidRootPart")
+end)
 
 -- ============================================================
 --  PER-PLAYER STATE
 -- ============================================================
 local PS = {}
-
 local function GetPS(uid)
     if not PS[uid] then
         PS[uid] = {
-            prevVel        = Vector3.zero,
-            heavyAlert     = false,
-            heavyAlertExp  = 0,
-            combo          = 0,
-            lastHitTime    = 0,
-            history        = {},
-            avgInterval    = nil,
-            lastAnimFire   = {},
-            comboLockOn    = false,
-            comboLockExp   = 0,
-            comboLockCount = 0,
-            m2Detected     = false,
-            m2DetectedExp  = 0,
-            burstOn        = false,
-            burstExp       = 0,
-            lastVelSpike   = 0,
-            watched        = false,
-            cachedScore    = 0,
-            cachedHeavy    = false,
-            cacheTime      = 0,
+            prevVel       = Vector3.zero,
+            heavyAlert    = false,
+            heavyAlertExp = 0,
+            combo         = 0,
+            lastHitTime   = 0,
+            history       = {},
+            avgInterval   = nil,
+            lastAnimFire  = {},
+            lastVelSpike  = 0,
+            watched       = false,
+            cachedScore   = 0,
+            cachedHeavy   = false,
+            cacheTime     = 0,
+            m2Detected    = false,
+            m2DetectedExp = 0,
         }
     end
     return PS[uid]
 end
-
-local function CleanPS(uid) PS[uid] = nil end
+local function CleanPS(uid) PS[uid]=nil end
 Players.PlayerRemoving:Connect(function(p) CleanPS(p.UserId) end)
-
--- ============================================================
---  LOCAL CHARACTER REF
--- ============================================================
-local MyChar = {char=nil, hum=nil, root=nil}
-
-local function RefreshChar()
-    local c = LP.Character
-    if not c then MyChar.char=nil; MyChar.hum=nil; MyChar.root=nil; return false end
-    MyChar.char = c
-    MyChar.hum  = c:FindFirstChildWhichIsA("Humanoid")
-    MyChar.root = c:FindFirstChild("HumanoidRootPart")
-    return MyChar.root ~= nil
-end
-
-LP.CharacterAdded:Connect(function(c)
-    MyChar.char = c
-    MyChar.hum  = c:WaitForChild("Humanoid")
-    MyChar.root = c:WaitForChild("HumanoidRootPart")
-end)
 
 -- ============================================================
 --  PARRY STATE
@@ -338,332 +257,342 @@ local Parry = {
     parryCount   = 0,
     missCount    = 0,
     consecMiss   = 0,
-    dynThreshold = PCFG.ScoreThreshold,
+    dynThreshold = CFG.ScoreThreshold,
     lastHB       = 0,
+    spamActive   = false,  -- currently in spam sequence
+}
+
+-- ============================================================
+--  SMART LOCK STATE
+-- ============================================================
+local Lock = {
+    on          = false,     -- user toggle (RCtrl)
+    target      = nil,       -- current locked player
+    expireTime  = 0,
+    combatTime  = 0,         -- last time combat was detected (hit or got hit)
+    inCombat    = false,     -- currently in combat engagement
+    prevPos     = nil,
+    vel         = Vector3.zero,
+    lastVelT    = 0,
+    alignOri    = nil,
+    att0        = nil,
+    candidates  = {},
+    lastSwitch  = 0,
 }
 
 -- ============================================================
 --  HELPERS
 -- ============================================================
-local function Dist(a, b)
+local function Dist(a,b)
     if not a or not b then return 9999 end
-    return (a.Position - b.Position).Magnitude
+    return (a.Position-b.Position).Magnitude
 end
 
 local function IsSelfAttacking()
-    if not PCFG.SelfGuard then return false end
-    local c = MyChar.char; local h = MyChar.hum
+    if not CFG.SelfGuard then return false end
+    local c=MC.char; local h=MC.hum
     if not c then return false end
     for _,a in ipairs(SELF_ATKS) do
-        if c:GetAttribute(a) == true then return true end
-        if h and h:GetAttribute(a) == true then return true end
+        if c:GetAttribute(a)==true then return true end
+        if h and h:GetAttribute(a)==true then return true end
     end
     return false
 end
 
 local function IsFromBack(er)
-    if not PCFG.BackParryGuard then return false end
-    local root = MyChar.root
+    if not CFG.BackParryGuard then return false end
+    local root=MC.root
     if not root or not er then return false end
-    local toEnemy = er.Position - root.Position
-    toEnemy = Vector3.new(toEnemy.X, 0, toEnemy.Z)
-    if toEnemy.Magnitude < 0.1 then return false end
-    local myLook = root.CFrame.LookVector
-    myLook = Vector3.new(myLook.X, 0, myLook.Z)
-    if myLook.Magnitude < 0.1 then return false end
-    return myLook.Unit:Dot(toEnemy.Unit) < PCFG.BackAngleThresh
+    local toE = er.Position-root.Position
+    toE = Vector3.new(toE.X,0,toE.Z)
+    if toE.Magnitude<0.1 then return false end
+    local look = root.CFrame.LookVector
+    look = Vector3.new(look.X,0,look.Z)
+    if look.Magnitude<0.1 then return false end
+    return look.Unit:Dot(toE.Unit) < CFG.BackAngleThresh
 end
 
 local function IsM2Anim(n)
-    n = n:lower()
+    n=n:lower()
     for k in pairs(M2_KW_SET) do if n:find(k,1,true) then return true end end
     return false
 end
-
 local function IsM1Anim(n)
-    n = n:lower()
+    n=n:lower()
     for _,k in ipairs(M1_KW) do if n:find(k,1,true) then return true end end
     return false
 end
-
-local function IsHeavyAttr(a) return M2_ATTR_SET[a] == true end
+local function IsHeavyAttr(a) return M2_ATTR_SET[a]==true end
 
 local function ScanAttrs(char, eh)
     for _,a in ipairs(ALL_ATTR) do
-        local v = char:GetAttribute(a)
-        if v == true then return true, IsHeavyAttr(a), a end
+        local v=char:GetAttribute(a)
+        if v==true then return true,IsHeavyAttr(a),a end
         if type(v)=="string" and (v:lower():find("attack") or v:lower():find("heavy")) then
-            return true, IsHeavyAttr(a), a
+            return true,IsHeavyAttr(a),a
         end
         if eh then
-            v = eh:GetAttribute(a)
-            if v == true then return true, IsHeavyAttr(a), a end
+            v=eh:GetAttribute(a)
+            if v==true then return true,IsHeavyAttr(a),a end
         end
     end
-    return false, false, nil
+    return false,false,nil
 end
 
 -- ============================================================
---  COMBO / BURST / LOCK SYSTEM
+--  COMBAT LOCK HELPERS (for smart lock)
+-- ============================================================
+local function MarkCombat()
+    -- called whenever we hit or get hit
+    Lock.combatTime = os.clock()
+    Lock.inCombat   = true
+end
+
+local function CheckCombatNeutral()
+    -- called every frame — neutralizes lock after timeout
+    if not Lock.inCombat then return end
+    if os.clock() - Lock.combatTime > CFG.NeutralTimeout then
+        Lock.inCombat = false
+        -- unlock aim when idle
+        if Lock.target then
+            Lock.target   = nil
+            Lock.prevPos  = nil
+            Lock.vel      = Vector3.zero
+            if Lock.alignOri then
+                pcall(function() Lock.alignOri:Destroy() end); Lock.alignOri=nil
+            end
+            if Lock.att0 then
+                pcall(function() Lock.att0:Destroy() end); Lock.att0=nil
+            end
+        end
+    end
+end
+
+-- ============================================================
+--  COMBO / HISTORY
 -- ============================================================
 local function RecordHit(ps, isHeavy, src)
-    local now = os.clock()
-    local h   = ps.history
-    table.insert(h, {t=now, h=isHeavy, s=src})
-    if #h > PCFG.HistoryDepth then table.remove(h, 1) end
-    ps.lastHitTime = now
-    if #h >= 3 then
-        local sum, n = 0, 0
-        for i = 2, #h do sum = sum + h[i].t - h[i-1].t; n = n+1 end
-        ps.avgInterval = sum/n
-    else
-        ps.avgInterval = nil
-    end
-end
-
-local function ActivateBurst(ps)
-    if not PCFG.BurstEnabled then return end
-    ps.burstOn  = true
-    ps.burstExp = os.clock() + (PCFG.BurstFireCount * PCFG.BurstFireDelay) + 0.3
-end
-
-local function IsBurst(ps)
-    if not ps.burstOn then return false end
-    if os.clock() > ps.burstExp then ps.burstOn = false; return false end
-    return true
-end
-
-local function ActivateComboLock(ps, cycles)
-    if not PCFG.ComboLockEnabled then return end
-    ps.comboLockOn    = true
-    ps.comboLockCount = math.min(cycles or 3, PCFG.ComboLockMax)
-    ps.comboLockExp   = os.clock() + PCFG.ComboLockWindow
-end
-
-local function TickComboLock(ps)
-    if not ps.comboLockOn then return false end
-    if os.clock() >= ps.comboLockExp then
-        if ps.comboLockCount > 0 then
-            ps.comboLockCount = ps.comboLockCount - 1
-            ps.comboLockExp   = os.clock() + PCFG.ComboLockWindow
-            return true
-        else
-            ps.comboLockOn = false; return false
-        end
-    end
-    return false
+    local now=os.clock()
+    local h=ps.history
+    table.insert(h,{t=now,h=isHeavy,s=src})
+    if #h>CFG.HistoryDepth then table.remove(h,1) end
+    ps.lastHitTime=now
+    if #h>=3 then
+        local sum,n=0,0
+        for i=2,#h do sum=sum+h[i].t-h[i-1].t; n=n+1 end
+        ps.avgInterval=sum/n
+    else ps.avgInterval=nil end
 end
 
 local function UpdateCombo(ps, uid, isHeavy, src)
-    local now = os.clock()
-    if now - ps.lastHitTime > PCFG.ChainWindow then
-        ps.combo = 0; ps.comboLockOn = false; ps.burstOn = false
+    local now=os.clock()
+    if now-ps.lastHitTime>CFG.ChainWindow then
+        ps.combo=0
     end
-    RecordHit(ps, isHeavy, src)
-    ps.combo = ps.combo + 1
-    if ps.combo >= PCFG.BurstTrigger then ActivateBurst(ps) end
-    if ps.combo >= 2 then
-        local avg = ps.avgInterval
-        if avg and avg < 0.6 then
-            ActivateComboLock(ps, math.min(ps.combo+2, PCFG.ComboLockMax))
-        end
-    end
+    RecordHit(ps,isHeavy,src)
+    ps.combo=ps.combo+1
     return ps.combo
 end
 
 local function UpdateThreshold(missed)
     if missed then
-        Parry.consecMiss   = Parry.consecMiss + 1
-        Parry.dynThreshold = math.max(
-            PCFG.ThresholdFloor,
-            Parry.dynThreshold - PCFG.MissDecay * math.min(Parry.consecMiss, 3)
+        Parry.consecMiss=Parry.consecMiss+1
+        Parry.dynThreshold=math.max(
+            CFG.ThresholdFloor,
+            Parry.dynThreshold - CFG.MissDecay*math.min(Parry.consecMiss,3)
         )
     else
-        Parry.consecMiss   = 0
-        Parry.dynThreshold = math.min(PCFG.ScoreThreshold, Parry.dynThreshold + 1)
+        Parry.consecMiss=0
+        Parry.dynThreshold=math.min(CFG.ScoreThreshold, Parry.dynThreshold+1)
     end
 end
 
-local function GetMultiFire(ps)
-    -- MultiFire is OFF by default for AC bypass
-    -- Only fires once per trigger to stay under rate limit
-    if not PCFG.MultiFireEnabled then return 1 end
-    local combo = ps.combo
-    local base  = PCFG.MultiFireBase
-    if combo >= 5 then base = PCFG.MultiFireMax
-    elseif combo >= 3 then base = base + 1
-    elseif combo >= 1 then base = base + 0 end
-    return math.min(PCFG.MultiFireMax, base)
-end
-
 -- ============================================================
---  RAW PARRY — humanized, jittered, rate-limited
+--  RAW PARRY — single fire with humanized timing
 -- ============================================================
 local function RawParry()
-    -- Rate limit check — self-throttle before server does
-    if not RateLimiter:CanFire() then return false end
-
-    local p      = Ping:get()
-    local tap    = TapWindow()
-    -- ping compensation: reduce tap on high ping
-    if p > 150 then
-        tap = math.max(PCFG.TapWindowMin, tap - (p-150)/8000)
-    end
-
+    if not RL:ok() then return false end
+    local p   = Ping:get()
+    local tap = TapWindow()
+    if p>150 then tap=math.max(CFG.TapMin, tap-(p-150)/7000) end
     local jPre  = Jitter()
     local jPost = Jitter()
-
     pcall(function()
-        task.wait(jPre)               -- human reaction pre-delay
+        task.wait(jPre)
         RequestBlock:FireServer(true)
-        RateLimiter:Record()
-        task.wait(tap)                -- hold window (randomized)
-        task.wait(jPost)              -- micro-jitter before release
+        RL:mark()
+        task.wait(tap)
+        task.wait(jPost)
         RequestBlock:FireServer(false)
     end)
     return true
 end
 
 -- ============================================================
---  FIRE PARRY
+--  SPAM PARRY — fires SpamCount times like manual block spam
+--  This is what guarantees the parry window gets hit
+--  Even if timing is slightly off, one of the N fires lands
+-- ============================================================
+local function SpamParry(isHeavy)
+    if Parry.spamActive then return end
+    Parry.spamActive = true
+
+    local count = CFG.SpamCount
+    -- Heavy attacks: more fires, tighter interval
+    if isHeavy then
+        count = CFG.SpamCount + 2
+    end
+
+    -- Pre-fire lead: start slightly before confirmed detection
+    local lead = Ping:lead()
+    if CFG.PreFireLead and lead > 0.003 then
+        task.wait(lead * 0.5)
+    end
+
+    task.spawn(function()
+        for i = 1, count do
+            if not Parry.on then break end
+            if not RL:ok() then
+                task.wait(0.04)  -- brief wait if rate limited, then continue
+            end
+            RawParry()
+            if i < count then
+                task.wait(CFG.SpamInterval + Jitter())
+            end
+        end
+        Parry.spamActive = false
+    end)
+end
+
+-- ============================================================
+--  FIRE PARRY — main trigger with spam underneath
 -- ============================================================
 local function CanFire()
     if not Parry.on then return false end
     if Parry.firing then
-        if os.clock() - Parry.firingAt > PCFG.FiringTimeout then
-            Parry.firing = false
-        else
-            return false
-        end
+        if os.clock()-Parry.firingAt > CFG.FiringTimeout then
+            Parry.firing=false
+        else return false end
     end
-    if os.clock() < Parry.nextFire then return false end
-    if not MyChar.root then return false end
+    if os.clock()<Parry.nextFire then return false end
+    if not MC.root then return false end
     if IsSelfAttacking() then return false end
     return true
 end
 
-local function FireParry(isHeavy, force, ps)
+local function FireParry(isHeavy, ps)
     if not CanFire() then return false end
-    local cd = Ping:cooldown(isHeavy)
+    local cd = Ping:cd(isHeavy)
+    -- cooldown jitter so period isn't perfectly regular
+    local cdJ = math.random(-12,18)/1000
     Parry.firing   = true
     Parry.firingAt = os.clock()
-    -- add small jitter to cooldown so timing isn't perfectly periodic
-    local cdJitter = math.random(-15, 20) / 1000
-    Parry.nextFire = os.clock() + cd + cdJitter
-
-    local lead    = Ping:lead()
-    local mfCount = ps and GetMultiFire(ps) or 1
+    Parry.nextFire = os.clock() + cd + cdJ
 
     task.spawn(function()
-        pcall(function()
-            -- pre-fire lead compensation (ping-based, not spam)
-            if lead > 0.005 then task.wait(lead) end
-            for i = 1, mfCount do
-                if IsSelfAttacking() then break end
-                local ok = RawParry()
-                if not ok then break end  -- rate limited, stop
-                if i < mfCount then
-                    task.wait(PCFG.MultiFireDelay + Jitter())
-                end
-            end
-        end)
-        task.wait(0.04)
+        SpamParry(isHeavy)
+        task.wait(CFG.SpamCount * CFG.SpamInterval + 0.05)
         Parry.firing = false
     end)
     return true
 end
 
-local function FireM2Instant(ps)
-    if not PCFG.M2InstantEnabled then return end
-    if Parry.firing and os.clock()-Parry.firingAt > 0.08 then Parry.firing = false end
+-- M2 instant: force-fire spam immediately, bypass cooldown check
+local function FireM2Instant()
+    -- reset cooldown so spam fires right now
     Parry.nextFire = 0
+    Parry.firing   = false
+    if Parry.spamActive then return end
+    Parry.spamActive = true
     task.spawn(function()
-        for i = 1, PCFG.M2PreCount do
-            if not RateLimiter:CanFire() then break end  -- self-throttle
+        for i = 1, CFG.SpamCount + 2 do
+            if not RL:ok() then task.wait(0.03) end
             RawParry()
-            task.wait(PCFG.M2PreDelay + Jitter())
+            if i < CFG.SpamCount+2 then
+                task.wait(CFG.SpamInterval * 0.8 + Jitter())
+            end
         end
+        Parry.spamActive = false
     end)
 end
 
 -- ============================================================
---  SCORE SYSTEM — unchanged from v1, accuracy preserved
+--  SCORE SYSTEM — lowered thresholds for max coverage
 -- ============================================================
 local function GetSwingBonus(er, root)
-    if not PCFG.AnglePredict or not root or not er then return 0 end
-    local toMe = root.Position - er.Position
+    if not CFG.AnglePredict or not root or not er then return 0 end
+    local toMe = root.Position-er.Position
     local d    = toMe.Magnitude
-    if d < 0.1 then return 0 end
+    if d<0.1 then return 0 end
     local dirN = toMe/d
     local fDot = er.CFrame.LookVector:Dot(dirN)
     local sDot = math.abs(er.CFrame.RightVector:Dot(dirN))
-    local b = 0
-    if fDot > 0.5  then b = b + 14 end
-    if sDot > 0.4  then b = b + 10 end
-    if fDot > 0.78 then b = b + 8  end
+    local b=0
+    if fDot>0.5  then b=b+14 end
+    if sDot>0.4  then b=b+10 end
+    if fDot>0.78 then b=b+8  end
     return b
 end
 
 local function GetVelBonus(ps, er, root)
-    if not PCFG.VelSharpening or not root or not er then return 0 end
-    local vel  = er.Velocity
-    local prev = ps.prevVel
-    ps.prevVel = vel
-    local acc  = (vel - prev).Magnitude
-    if acc < 2 then return 0 end
-    local toMe = root.Position - er.Position
-    if toMe.Magnitude < 0.1 or vel.Magnitude < 0.1 then return 0 end
-    local dot = toMe.Unit:Dot(vel.Unit)
-    local b = 0
-    if dot > 0.25 then b = b + math.floor(dot*30) end
-    if math.abs(vel.Unit.Y) > 0.35 and dot > 0.1 then b = b + 12 end
-    return math.min(b, 42)
+    if not CFG.VelSharpening or not root or not er then return 0 end
+    local vel=er.Velocity; local prev=ps.prevVel
+    ps.prevVel=vel
+    local acc=(vel-prev).Magnitude
+    if acc<2 then return 0 end
+    local toMe=root.Position-er.Position
+    if toMe.Magnitude<0.1 or vel.Magnitude<0.1 then return 0 end
+    local dot=toMe.Unit:Dot(vel.Unit)
+    local b=0
+    if dot>0.25 then b=b+math.floor(dot*30) end
+    if math.abs(vel.Unit.Y)>0.35 and dot>0.1 then b=b+12 end
+    return math.min(b,42)
 end
 
-local SCORE_CACHE_TTL = 0.022
+local SCORE_TTL = 0.018
 
 local function Score(p, ps)
-    local now = os.clock()
-    if now - ps.cacheTime < SCORE_CACHE_TTL then
+    local now=os.clock()
+    if now-ps.cacheTime < SCORE_TTL then
         return ps.cachedScore, ps.cachedHeavy
     end
-    local ec   = p.Character
-    local root = MyChar.root
-    if not ec or not root then ps.cachedScore=0; return 0, false end
-    local er = ec:FindFirstChild("HumanoidRootPart")
-    local eh = ec:FindFirstChildWhichIsA("Humanoid")
-    if not er or not eh or eh.Health <= 0 then
-        ps.cachedScore=0; return 0, false
-    end
-    local d = Dist(root, er)
-    if d > PCFG.Range or IsFromBack(er) then
-        ps.cachedScore=0; return 0, false
-    end
+    local ec=p.Character; local root=MC.root
+    if not ec or not root then ps.cachedScore=0; return 0,false end
+    local er=ec:FindFirstChild("HumanoidRootPart")
+    local eh=ec:FindFirstChildWhichIsA("Humanoid")
+    if not er or not eh or eh.Health<=0 then ps.cachedScore=0; return 0,false end
+    local d=Dist(root,er)
+    if d>CFG.ParryRange or IsFromBack(er) then ps.cachedScore=0; return 0,false end
 
-    local sc = 0; local hvy = false
-    sc = sc + math.floor((1 - d/PCFG.Range)*15)
+    local sc=0; local hvy=false
 
-    local hasAttr, isHAttr = ScanAttrs(ec, eh)
-    if isHAttr then sc=sc+80; hvy=true
-    elseif hasAttr then sc=sc+50 end
+    -- distance bonus
+    sc=sc+math.floor((1-d/CFG.ParryRange)*15)
 
-    if ec:GetAttribute("InCombat") == true then sc=sc+10 end
-    if ec:GetAttribute("FightMode") == true then sc=sc+8  end
+    -- attribute detection — highest weight
+    local hasAttr,isHAttr=ScanAttrs(ec,eh)
+    if isHAttr then sc=sc+85; hvy=true
+    elseif hasAttr then sc=sc+55 end
 
-    local anim = eh:FindFirstChildOfClass("Animator")
+    -- combat state
+    if ec:GetAttribute("InCombat")==true  then sc=sc+12 end
+    if ec:GetAttribute("FightMode")==true then sc=sc+10 end
+
+    -- animation detection — catches what attributes miss
+    local anim=eh:FindFirstChildOfClass("Animator")
     if anim then
-        local ok2, tracks = pcall(function() return anim:GetPlayingAnimationTracks() end)
-        if ok2 and tracks then
+        local ok,tracks=pcall(function() return anim:GetPlayingAnimationTracks() end)
+        if ok and tracks then
             for _,t in pairs(tracks) do
                 if t and t.IsPlaying then
-                    local n   = t.Animation.Name
-                    local pos = t.TimePosition
+                    local n=t.Animation.Name; local pos=t.TimePosition
                     if IsM2Anim(n) then
-                        hvy = true
-                        sc  = sc + (pos <= PCFG.PreFireThreshold and 75 or pos < 0.25 and 60 or 35)
+                        hvy=true
+                        -- score is higher at earlier positions (pre-fire)
+                        sc=sc+(pos<=0.05 and 80 or pos<=0.12 and 70 or pos<0.25 and 55 or 38)
                         break
                     elseif IsM1Anim(n) then
-                        sc  = sc + (pos <= PCFG.PreFireThreshold and 65 or pos < 0.18 and 50 or 22)
+                        sc=sc+(pos<=0.05 and 70 or pos<=0.10 and 60 or pos<0.18 and 48 or 25)
                         break
                     end
                 end
@@ -671,26 +600,26 @@ local function Score(p, ps)
         end
     end
 
-    if ps.heavyAlert and os.clock() < ps.heavyAlertExp then sc=sc+30; hvy=true end
+    -- heavy alert (set by FX events)
+    if ps.heavyAlert and os.clock()<ps.heavyAlertExp then sc=sc+35; hvy=true end
 
-    local combo = ps.combo
-    if combo > 0 then sc = sc + math.min(combo*10, 50) end
-    if IsBurst(ps) then sc = sc + 30 end
-    local avg = ps.avgInterval
-    if avg and avg < 0.4 then sc = sc + math.floor((1-avg/0.4)*18) end
+    -- combo history
+    local combo=ps.combo
+    if combo>0 then sc=sc+math.min(combo*12,55) end
+    local avg=ps.avgInterval
+    if avg and avg<0.4 then sc=sc+math.floor((1-avg/0.4)*20) end
 
-    sc = sc + GetSwingBonus(er, root)
-    sc = sc + GetVelBonus(ps, er, root)
+    -- geometry bonuses
+    sc=sc+GetSwingBonus(er,root)
+    sc=sc+GetVelBonus(ps,er,root)
 
-    if d < 8 then
-        local toMe = (root.Position - er.Position).Unit
-        if toMe:Dot(er.CFrame.LookVector) > 0.62 then sc = sc + 15 end
+    if d<8 then
+        local toMe=(root.Position-er.Position).Unit
+        if toMe:Dot(er.CFrame.LookVector)>0.62 then sc=sc+15 end
     end
 
-    local final     = math.min(sc, 140)
-    ps.cachedScore  = final
-    ps.cachedHeavy  = hvy
-    ps.cacheTime    = now
+    local final=math.min(sc, CFG.ScoreMax)
+    ps.cachedScore=final; ps.cachedHeavy=hvy; ps.cacheTime=now
     return final, hvy
 end
 
@@ -698,184 +627,174 @@ end
 --  BUILD QUEUE
 -- ============================================================
 local function BuildQueue()
-    local q = {}
+    local q={}
     for _,p in pairs(Players:GetPlayers()) do
-        if p ~= LP then
-            local ps    = GetPS(p.UserId)
-            local sc,hv = Score(p, ps)
-            if sc >= Parry.dynThreshold then
-                table.insert(q, {player=p, score=sc, heavy=hv, ps=ps})
+        if p~=LP then
+            local ps=GetPS(p.UserId)
+            local sc,hv=Score(p,ps)
+            if sc>=Parry.dynThreshold then
+                table.insert(q,{player=p,score=sc,heavy=hv,ps=ps})
             end
         end
     end
-    table.sort(q, function(a,b) return a.score > b.score end)
-    while #q > PCFG.MaxQueueTargets do table.remove(q) end
+    table.sort(q,function(a,b) return a.score>b.score end)
+    while #q>CFG.MaxQueueTargets do table.remove(q) end
     return q
 end
 
 -- ============================================================
---  VEL PRE-FIRE (disabled by default, toggle in config)
+--  VEL PRE-FIRE
 -- ============================================================
 local function CheckVelPreFire(p, ps, er)
-    if not PCFG.VelPreFire or not MyChar.root or not er then return end
+    if not CFG.VelPreFire or not MC.root or not er then return end
     if IsFromBack(er) then return end
-    local vel  = er.Velocity
-    local prev = ps.prevVel
-    local acc  = (vel - prev).Magnitude
-    if acc >= PCFG.VelPreFireThresh then
-        local toMe = MyChar.root.Position - er.Position
-        if toMe.Magnitude < 0.1 or vel.Magnitude < 0.1 then return end
-        local dot = toMe.Unit:Dot(vel.Unit)
-        if dot > 0.3 then
-            local now = os.clock()
-            if now - ps.lastVelSpike > 0.18 then
-                ps.lastVelSpike = now
-                FireParry(false, true, ps)
+    local vel=er.Velocity; local prev=ps.prevVel
+    local acc=(vel-prev).Magnitude
+    if acc>=CFG.VelPreFireThresh then
+        local toMe=MC.root.Position-er.Position
+        if toMe.Magnitude<0.1 or vel.Magnitude<0.1 then return end
+        local dot=toMe.Unit:Dot(vel.Unit)
+        if dot>0.28 then
+            local now=os.clock()
+            if now-ps.lastVelSpike>0.14 then
+                ps.lastVelSpike=now
+                FireParry(false,ps)
             end
         end
     end
 end
 
 -- ============================================================
---  HEARTBEAT — main parry loop (throttled to 30fps)
+--  HEARTBEAT — main scan loop
 -- ============================================================
 RunService.Heartbeat:Connect(function()
     if not Parry.on then return end
-    if not MyChar.root then RefreshChar() end
-    if not MyChar.root then return end
+    if not MC.root then RefreshChar() end
+    if not MC.root then return end
     if IsSelfAttacking() then return end
 
-    local now = os.clock()
-    if now - Parry.lastHB < PCFG.HeartbeatDebounce then return end
-    Parry.lastHB = now
+    local now=os.clock()
+    if now-Parry.lastHB < CFG.HeartbeatRate then return end
+    Parry.lastHB=now
 
+    -- vel pre-fire scan
     for _,p in pairs(Players:GetPlayers()) do
-        if p ~= LP and p.Character then
-            local er = p.Character:FindFirstChild("HumanoidRootPart")
-            if er and Dist(MyChar.root, er) <= PCFG.Range then
+        if p~=LP and p.Character then
+            local er=p.Character:FindFirstChild("HumanoidRootPart")
+            if er and Dist(MC.root,er)<=CFG.ParryRange then
                 if not IsFromBack(er) then
-                    local ps = GetPS(p.UserId)
-                    if ps.comboLockOn and TickComboLock(ps) then
-                        if now >= Parry.nextFire then FireParry(false, true, ps) end
-                    end
-                    if IsBurst(ps) and now >= Parry.nextFire then
-                        FireParry(false, true, ps)
-                    end
-                    CheckVelPreFire(p, ps, er)
+                    local ps=GetPS(p.UserId)
+                    CheckVelPreFire(p,ps,er)
                 end
             end
         end
     end
 
-    if now < Parry.nextFire then return end
-    local q = BuildQueue()
-    if #q > 0 then
-        local top = q[1]; local ps = top.ps; local uid = top.player.UserId
+    if now<Parry.nextFire then return end
+    local q=BuildQueue()
+    if #q>0 then
+        local top=q[1]; local ps=top.ps; local uid=top.player.UserId
         if top.heavy then
-            ps.heavyAlert    = true
-            ps.heavyAlertExp = now + 3
+            ps.heavyAlert=true
+            ps.heavyAlertExp=now+3
         end
-        local fired = FireParry(top.heavy, true, ps)
-        if fired then UpdateCombo(ps, uid, top.heavy, "HB"); UpdateThreshold(false) end
+        local fired=FireParry(top.heavy,ps)
+        if fired then UpdateCombo(ps,uid,top.heavy,"HB"); UpdateThreshold(false) end
     end
 end)
 
 -- ============================================================
 --  WATCH CHAR — attribute + animation listeners
+--  These fire instantly on state change = zero latency detection
 -- ============================================================
 local function WatchChar(p, char)
     if not char then return end
-    local er  = char:FindFirstChild("HumanoidRootPart")
-    local eh  = char:FindFirstChildWhichIsA("Humanoid")
-    local uid = p.UserId
-    local ps  = GetPS(uid)
+    local er=char:FindFirstChild("HumanoidRootPart")
+    local eh=char:FindFirstChildWhichIsA("Humanoid")
+    local uid=p.UserId
+    local ps=GetPS(uid)
 
     local function onAttrChange(obj, attr)
         pcall(function()
             obj:GetAttributeChangedSignal(attr):Connect(function()
                 if not Parry.on or IsSelfAttacking() then return end
-                local v = obj:GetAttribute(attr)
+                local v=obj:GetAttribute(attr)
                 if not (v==true or (type(v)=="string" and
                     (v:lower():find("attack") or v:lower():find("heavy")))) then return end
-                er = char:FindFirstChild("HumanoidRootPart")
-                if not er or not MyChar.root then return end
-                if Dist(MyChar.root, er) > PCFG.Range then return end
+                er=char:FindFirstChild("HumanoidRootPart")
+                if not er or not MC.root then return end
+                if Dist(MC.root,er)>CFG.ParryRange then return end
                 if IsFromBack(er) then return end
-                local isHvy = IsHeavyAttr(attr)
+                local isHvy=IsHeavyAttr(attr)
                 if isHvy then
-                    ps.heavyAlert    = true
-                    ps.heavyAlertExp = os.clock() + 3
-                    if not ps.m2Detected or os.clock() >= ps.m2DetectedExp then
-                        ps.m2Detected    = true
-                        ps.m2DetectedExp = os.clock() + 2
-                        FireM2Instant(ps); return
+                    ps.heavyAlert=true
+                    ps.heavyAlertExp=os.clock()+3
+                    if not ps.m2Detected or os.clock()>=ps.m2DetectedExp then
+                        ps.m2Detected=true
+                        ps.m2DetectedExp=os.clock()+2
+                        FireM2Instant(); return
                     end
                 end
-                UpdateCombo(ps, uid, isHvy, attr)
-                FireParry(isHvy, true, ps)
+                UpdateCombo(ps,uid,isHvy,attr)
+                FireParry(isHvy,ps)
             end)
         end)
     end
 
     for _,a in ipairs(ALL_ATTR) do
-        onAttrChange(char, a)
-        if eh then onAttrChange(eh, a) end
+        onAttrChange(char,a)
+        if eh then onAttrChange(eh,a) end
     end
 
+    -- animation listener: catches anim-only attacks with no attribute
     local function watchAnim(animator)
         pcall(function()
             animator.AnimationPlayed:Connect(function(track)
                 if not Parry.on or not track then return end
                 if IsSelfAttacking() then return end
-                local ok2, n = pcall(function() return track.Animation.Name end)
-                if not ok2 or not n then return end
-                local isH = IsM2Anim(n); local isM = IsM1Anim(n)
+                local ok,n=pcall(function() return track.Animation.Name end)
+                if not ok or not n then return end
+                local isH=IsM2Anim(n); local isM=IsM1Anim(n)
                 if not isH and not isM then return end
-                er = char:FindFirstChild("HumanoidRootPart")
-                if not er or not MyChar.root then return end
-                if Dist(MyChar.root, er) > PCFG.Range then return end
+                er=char:FindFirstChild("HumanoidRootPart")
+                if not er or not MC.root then return end
+                if Dist(MC.root,er)>CFG.ParryRange then return end
                 if IsFromBack(er) then return end
-                local now = os.clock()
-                local cK  = string.format("%d_%s", uid, n)
-                if now - (ps.lastAnimFire[cK] or 0) < 0.20 then return end
-                ps.lastAnimFire[cK] = now
-                UpdateCombo(ps, uid, isH, n)
+                local now=os.clock()
+                local cK=string.format("%d_%s",uid,n)
+                if now-(ps.lastAnimFire[cK] or 0) < 0.16 then return end
+                ps.lastAnimFire[cK]=now
+                UpdateCombo(ps,uid,isH,n)
                 if isH then
-                    ps.heavyAlert    = true
-                    ps.heavyAlertExp = now + 3
-                    FireM2Instant(ps)
+                    ps.heavyAlert=true; ps.heavyAlertExp=now+3
+                    FireM2Instant()
                 else
-                    FireParry(false, true, ps)
+                    FireParry(false,ps)
                 end
             end)
         end)
     end
 
     if eh then
-        local an = eh:FindFirstChildOfClass("Animator")
-        if an then
-            watchAnim(an)
-        else
-            eh.ChildAdded:Connect(function(c)
-                if c:IsA("Animator") then watchAnim(c) end
-            end)
-        end
+        local an=eh:FindFirstChildOfClass("Animator")
+        if an then watchAnim(an)
+        else eh.ChildAdded:Connect(function(c)
+            if c:IsA("Animator") then watchAnim(c) end
+        end) end
     end
 end
 
 local function Watch(p)
-    if not p or p == LP then return end
-    local ps = GetPS(p.UserId)
+    if not p or p==LP then return end
+    local ps=GetPS(p.UserId)
     if ps.watched then return end
-    ps.watched = true
-    if p.Character then WatchChar(p, p.Character) end
+    ps.watched=true
+    if p.Character then WatchChar(p,p.Character) end
     p.CharacterAdded:Connect(function(c)
-        ps.watched = false
-        CleanPS(p.UserId)
+        ps.watched=false; CleanPS(p.UserId)
         task.wait(0.4); Watch(p)
     end)
 end
-
 local function WatchAll()
     for _,p in pairs(Players:GetPlayers()) do Watch(p) end
 end
@@ -883,477 +802,534 @@ WatchAll()
 Players.PlayerAdded:Connect(function(p) task.wait(0.3); Watch(p) end)
 
 -- ============================================================
---  PACKET HOOKS — react to incoming FX events
+--  FX PACKET HOOKS — server events = instant reaction
 -- ============================================================
+
+-- Kena hit → missed parry → reset + re-fire + mark combat
 if ReactionFX then
     ReactionFX.OnClientEvent:Connect(function()
-        Parry.nextFire = 0; Parry.firing = false
-        Parry.missCount = Parry.missCount + 1
+        MarkCombat()  -- got hit = in combat, lock activates
+        Parry.nextFire=0; Parry.firing=false; Parry.spamActive=false
+        Parry.missCount=Parry.missCount+1
         UpdateThreshold(true)
-        local root = MyChar.root
+        -- immediately attempt parry on the attacker
+        local root=MC.root
         for _,p in pairs(Players:GetPlayers()) do
-            if p ~= LP and p.Character then
-                local er = p.Character:FindFirstChild("HumanoidRootPart")
-                if er and root and Dist(root, er) <= PCFG.Range then
+            if p~=LP and p.Character then
+                local er=p.Character:FindFirstChild("HumanoidRootPart")
+                if er and root and Dist(root,er)<=CFG.ParryRange then
                     if not IsFromBack(er) then
-                        local ps = GetPS(p.UserId)
-                        UpdateCombo(ps, p.UserId, false, "ReactionFX")
-                        ActivateComboLock(ps, PCFG.ComboLockMax)
-                        ActivateBurst(ps)
+                        local ps=GetPS(p.UserId)
+                        UpdateCombo(ps,p.UserId,false,"ReactionFX")
+                        -- auto lock on attacker
+                        if Lock.on or Lock.inCombat then
+                            Lock.target=p
+                            Lock.expireTime=os.clock()+CFG.LockDuration
+                        end
                     end
                 end
             end
         end
-        FireParry(false, true, nil)
+        FireParry(false,nil)
     end)
 end
 
+-- Heavy hit incoming → instant M2 spam
 if HeavyPunchFX then
     HeavyPunchFX.OnClientEvent:Connect(function(attacker)
-        Parry.nextFire = 0; Parry.firing = false
-        if attacker and attacker ~= LP then
-            local ps = GetPS(attacker.UserId)
-            if ps then
-                ps.heavyAlert    = true
-                ps.heavyAlertExp = os.clock() + 3
+        MarkCombat()
+        Parry.nextFire=0; Parry.firing=false; Parry.spamActive=false
+        if attacker and attacker~=LP then
+            local ps=GetPS(attacker.UserId)
+            if ps then ps.heavyAlert=true; ps.heavyAlertExp=os.clock()+3 end
+            -- auto lock on heavy attacker
+            if Lock.on or Lock.inCombat then
+                Lock.target=attacker
+                Lock.expireTime=os.clock()+CFG.LockDuration
             end
         end
-        FireM2Instant(nil)
+        FireM2Instant()
     end)
 end
 
 if HitRunFX then
     HitRunFX.OnClientEvent:Connect(function()
-        Parry.nextFire = 0; Parry.firing = false
-        FireParry(false, true, nil)
+        MarkCombat()
+        Parry.nextFire=0; Parry.firing=false
+        FireParry(false,nil)
     end)
 end
 
 if KickComboFX then
     KickComboFX.OnClientEvent:Connect(function()
-        Parry.nextFire = 0; Parry.firing = false
-        FireParry(true, true, nil)
+        MarkCombat()
+        Parry.nextFire=0; Parry.firing=false
+        FireParry(true,nil)
     end)
 end
 
 if CounterHitFX then
     CounterHitFX.OnClientEvent:Connect(function()
-        Parry.nextFire = 0; Parry.firing = false
-        FireParry(false, true, nil)
+        MarkCombat()
+        Parry.nextFire=0; Parry.firing=false
+        FireParry(false,nil)
     end)
 end
 
 if GuardBreakFX then
     GuardBreakFX.OnClientEvent:Connect(function()
-        Parry.nextFire = 0; Parry.firing = false
+        Parry.nextFire=0; Parry.firing=false
     end)
 end
 
+-- Successful parry → mark combat (you're fighting)
 if ParryFX then
     ParryFX.OnClientEvent:Connect(function()
-        Parry.parryCount = Parry.parryCount + 1
+        MarkCombat()
+        Parry.parryCount=Parry.parryCount+1
         UpdateThreshold(false)
     end)
 end
 
 -- ============================================================
---  ON RESPAWN
+--  SMART LOCK — AUTO AIM SYSTEM
+--  Activates: you hit or get hit → auto lock nearest/attacker
+--  Deactivates: NeutralTimeout seconds of no combat → unlock
 -- ============================================================
-LP.CharacterAdded:Connect(function(c)
-    RefreshChar()
-    Parry.nextFire=0; Parry.firing=false; Parry.firingAt=0; Parry.lastHB=0
-    for uid in pairs(PS) do PS[uid]=nil end
-    Parry.dynThreshold = PCFG.ScoreThreshold
-    Parry.consecMiss   = 0
-    task.wait(0.7); WatchAll()
-end)
 
--- ============================================================
---  AUTO AIM SYSTEM
--- ============================================================
-local AS = {
-    Target     = nil,
-    ExpireTime = 0,
-    InCombat   = false,
-    PrevPos    = nil,
-    Vel        = Vector3.zero,
-    LastVelT   = 0,
-    AlignOri   = nil,
-    Att0       = nil,
-    Candidates = {},
-    IsAtk      = false,
-    LastProx   = 0,
-    LastSwitch = 0,
-}
-
-local function IsBlocked()
-    local c = LP.Character; if not c then return true end
-    for _,s in ipairs(ACFG.BlockedStates) do
-        if c:GetAttribute(s) == true then return true end
+local function LockIsBlocked()
+    local c=LP.Character; if not c then return true end
+    for _,s in ipairs(LOCK_BLOCKED) do
+        if c:GetAttribute(s)==true then return true end
     end
     return false
 end
 
 local function ValidTarget(t)
     if not t or not t.Parent then return false end
-    local c = t.Character; if not c then return false end
-    local h = c:FindFirstChild("Humanoid")
-    if not h or h.Health <= 0 then return false end
-    local r = c:FindFirstChild("HumanoidRootPart"); if not r then return false end
-    local myR = MyChar.root; if not myR then return false end
-    return Dist(myR, r) <= ACFG.LeashRange
+    local c=t.Character; if not c then return false end
+    local h=c:FindFirstChild("Humanoid")
+    if not h or h.Health<=0 then return false end
+    local r=c:FindFirstChild("HumanoidRootPart"); if not r then return false end
+    local myR=MC.root; if not myR then return false end
+    return Dist(myR,r)<=CFG.LockLeash
 end
-
-local function RefreshLock() AS.ExpireTime = os.clock() + ACFG.LockDuration end
 
 local function DestroyConstraint()
     pcall(function()
-        if AS.AlignOri then AS.AlignOri:Destroy(); AS.AlignOri=nil end
-        if AS.Att0     then AS.Att0:Destroy();     AS.Att0=nil     end
+        if Lock.alignOri then Lock.alignOri:Destroy(); Lock.alignOri=nil end
+        if Lock.att0     then Lock.att0:Destroy();     Lock.att0=nil     end
     end)
 end
 
 local function SetupConstraint()
-    local root = MyChar.root; if not root then return end
-    if AS.AlignOri and AS.AlignOri.Parent == root then return end
+    local root=MC.root; if not root then return end
+    if Lock.alignOri and Lock.alignOri.Parent==root then return end
     DestroyConstraint()
-    local att  = Instance.new("Attachment")
-    att.Name   = "_AA_A0"; att.Parent = root; AS.Att0 = att
-    local ao   = Instance.new("AlignOrientation")
-    ao.Name    = "_AA_AO"
-    ao.Mode    = Enum.OrientationAlignmentMode.OneAttachment
-    ao.Attachment0        = att
-    ao.MaxTorque          = ACFG.MaxTorque
-    ao.MaxAngularVelocity = math.huge
-    ao.Responsiveness     = ACFG.Responsiveness
-    ao.RigidityEnabled    = false
-    ao.PrimaryAxisOnly    = false
-    ao.Parent = root; AS.AlignOri = ao
+    local att=Instance.new("Attachment")
+    att.Name="_AA_A0"; att.Parent=root; Lock.att0=att
+    local ao=Instance.new("AlignOrientation")
+    ao.Name="_AA_AO"
+    ao.Mode=Enum.OrientationAlignmentMode.OneAttachment
+    ao.Attachment0=att
+    ao.MaxTorque=CFG.LockMaxTorque
+    ao.MaxAngularVelocity=math.huge
+    ao.Responsiveness=CFG.LockResponsive
+    ao.RigidityEnabled=false
+    ao.PrimaryAxisOnly=false
+    ao.Parent=root; Lock.alignOri=ao
 end
 
 local function SetAimDir(pos)
-    if not AS.AlignOri or IsBlocked() then return end
-    local root = MyChar.root; if not root then return end
-    local dir  = pos - root.Position
-    dir = Vector3.new(dir.X, dir.Y * 0.1, dir.Z)
-    if dir.Magnitude < 0.05 then return end
-    dir = dir.Unit
-    local up    = Vector3.new(0, 1, 0)
-    local right = dir:Cross(up)
-    if right.Magnitude < 0.01 then return end
-    right = right.Unit
-    AS.AlignOri.CFrame = CFrame.fromMatrix(Vector3.zero, right, right:Cross(dir).Unit)
+    if not Lock.alignOri or LockIsBlocked() then return end
+    local root=MC.root; if not root then return end
+    local dir=pos-root.Position
+    dir=Vector3.new(dir.X,dir.Y*0.1,dir.Z)
+    if dir.Magnitude<0.05 then return end
+    dir=dir.Unit
+    local up=Vector3.new(0,1,0)
+    local right=dir:Cross(up)
+    if right.Magnitude<0.01 then return end
+    right=right.Unit
+    Lock.alignOri.CFrame=CFrame.fromMatrix(Vector3.zero,right,right:Cross(dir).Unit)
 end
 
-local function UpdateVel(pos)
-    local now = os.clock(); local dt = now - AS.LastVelT
-    if AS.PrevPos and dt > 0 and dt < 0.3 then
-        AS.Vel = AS.Vel:Lerp((pos - AS.PrevPos)/dt, Ping:velLerp())
+local function UpdateLockVel(pos)
+    local now=os.clock(); local dt=now-Lock.lastVelT
+    if Lock.prevPos and dt>0 and dt<0.3 then
+        Lock.vel=Lock.vel:Lerp((pos-Lock.prevPos)/dt, Ping:vellerp())
     end
-    AS.PrevPos = pos; AS.LastVelT = now
+    Lock.prevPos=pos; Lock.lastVelT=now
 end
 
-local function Predict(pos, dt)
-    local hv = Vector3.new(AS.Vel.X, 0, AS.Vel.Z)
-    return pos + hv * ACFG.PredictFactor * dt
+local function PredictPos(pos, dt)
+    local hv=Vector3.new(Lock.vel.X,0,Lock.vel.Z)
+    return pos+hv*CFG.LockPredictFactor*dt
 end
 
-local LockOn, UnlockAll, SwitchNext
-
-local function GetBestTarget(rescan)
-    local root = MyChar.root; if not root then return nil end
-    if not rescan and AS.Target and ValidTarget(AS.Target) then return AS.Target end
-    AS.Candidates = {}
-    local best, bestD = nil, ACFG.Range
+local function GetNearestEnemy(inRange)
+    local root=MC.root; if not root then return nil end
+    local best,bestD=nil, inRange or CFG.LockRange
     for _,p in pairs(Players:GetPlayers()) do
-        if p ~= LP then
-            local c = p.Character; if not c then continue end
-            local r = c:FindFirstChild("HumanoidRootPart")
-            local h = c:FindFirstChild("Humanoid")
-            if not r or not h or h.Health <= 0 then continue end
-            local d = Dist(root, r)
-            if d <= ACFG.Range then
-                table.insert(AS.Candidates, {p=p, dist=d})
-                if d < bestD then bestD=d; best=p end
-            end
+        if p~=LP then
+            local c=p.Character; if not c then continue end
+            local r=c:FindFirstChild("HumanoidRootPart")
+            local h=c:FindFirstChild("Humanoid")
+            if not r or not h or h.Health<=0 then continue end
+            local d=Dist(root,r)
+            if d<=bestD then bestD=d; best=p end
         end
     end
-    table.sort(AS.Candidates, function(a,b) return a.dist < b.dist end)
     return best
 end
 
-LockOn = function(t)
-    if not t then return end
-    local isNew = (t ~= AS.Target)
-    AS.Target = t; AS.PrevPos = nil; AS.Vel = Vector3.zero
-    RefreshLock()
-    if isNew then SetupConstraint() end
+local function AutoLockOn(target)
+    if not target then return end
+    Lock.target=target
+    Lock.expireTime=os.clock()+CFG.LockDuration
+    Lock.prevPos=nil; Lock.vel=Vector3.zero
+    SetupConstraint()
 end
 
-UnlockAll = function()
-    AS.Target = nil; AS.PrevPos = nil; AS.Vel = Vector3.zero
-    DestroyConstraint()
-end
-
-SwitchNext = function()
-    if #AS.Candidates < 1 then
-        GetBestTarget(true)
-        if #AS.Candidates < 1 then return end
+-- These are called from combat events to trigger auto-lock
+local function OnYouHitSomeone(target)
+    MarkCombat()
+    if not Lock.on then return end  -- only auto-lock if lock mode is ON
+    if target and ValidTarget(target) then
+        AutoLockOn(target)
+    elseif not Lock.target or not ValidTarget(Lock.target) then
+        local near=GetNearestEnemy()
+        if near then AutoLockOn(near) end
     end
-    if not AS.Target then LockOn(AS.Candidates[1].p); return end
-    for i, c in ipairs(AS.Candidates) do
-        if c.p == AS.Target then
-            LockOn(AS.Candidates[i % #AS.Candidates + 1].p); return
-        end
-    end
-    LockOn(AS.Candidates[1].p)
 end
 
+local function OnYouGotHit(attacker)
+    MarkCombat()
+    if not Lock.on then return end
+    if attacker and ValidTarget(attacker) then
+        AutoLockOn(attacker)
+    elseif not Lock.target or not ValidTarget(Lock.target) then
+        local near=GetNearestEnemy()
+        if near then AutoLockOn(near) end
+    end
+end
+
+-- Hook into own character attributes to detect when YOU hit/get-hit
+LP.CharacterAdded:Connect(function(c)
+    local hum=c:WaitForChild("Humanoid")
+    -- Watch self attack attributes
+    for _,attr in ipairs(SELF_ATKS) do
+        pcall(function()
+            c:GetAttributeChangedSignal(attr):Connect(function()
+                local v=c:GetAttribute(attr)
+                if v==true then
+                    -- you started attacking — mark combat + lock nearest
+                    OnYouHitSomeone(Lock.target or GetNearestEnemy())
+                end
+            end)
+        end)
+    end
+    -- Health decrease = got hit
+    if hum then
+        local prevHP=hum.Health
+        hum:GetPropertyChangedSignal("Health"):Connect(function()
+            if hum.Health < prevHP then
+                -- you got hit — find nearest attacker to lock
+                OnYouGotHit(GetNearestEnemy(CFG.LockRange))
+            end
+            prevHP=hum.Health
+        end)
+    end
+end)
+
+-- Lock heartbeat: track target + neutral check
 RunService.Heartbeat:Connect(function(dt)
-    if Camera.CameraType ~= Enum.CameraType.Custom then
-        Camera.CameraType = Enum.CameraType.Custom
+    if Camera.CameraType~=Enum.CameraType.Custom then
+        Camera.CameraType=Enum.CameraType.Custom
     end
-    if not ACFG.ON then return end
-    if AS.Target and os.clock() > AS.ExpireTime then UnlockAll(); return end
-    if AS.Target and not ValidTarget(AS.Target) then UnlockAll(); return end
-    if not AS.Target then
-        local b = GetBestTarget(true); if b then LockOn(b) end
+
+    -- neutral decay check — unlock if been idle
+    CheckCombatNeutral()
+
+    -- if lock mode OFF and not in combat, skip aim
+    if not Lock.on and not Lock.inCombat then
+        if Lock.target then
+            DestroyConstraint()
+            Lock.target=nil
+        end
         return
     end
-    local ec = AS.Target.Character; if not ec then return end
-    local er = ec:FindFirstChild("HumanoidRootPart"); if not er then return end
-    UpdateVel(er.Position)
-    SetAimDir(Predict(er.Position, dt))
+
+    -- expire check
+    if Lock.target and os.clock()>Lock.expireTime then
+        Lock.target=nil; DestroyConstraint(); return
+    end
+    if Lock.target and not ValidTarget(Lock.target) then
+        Lock.target=nil; DestroyConstraint(); return
+    end
+
+    -- no target? try to find one if in combat
+    if not Lock.target and Lock.inCombat then
+        local near=GetNearestEnemy()
+        if near then AutoLockOn(near) end
+        return
+    end
+
+    if not Lock.target then return end
+
+    local ec=Lock.target.Character; if not ec then return end
+    local er=ec:FindFirstChild("HumanoidRootPart"); if not er then return end
+    UpdateLockVel(er.Position)
+    SetAimDir(PredictPos(er.Position,dt))
+end)
+
+-- Re-init on respawn
+LP.CharacterAdded:Connect(function(c)
+    RefreshChar()
+    Parry.nextFire=0; Parry.firing=false; Parry.firingAt=0
+    Parry.lastHB=0; Parry.spamActive=false
+    for uid in pairs(PS) do PS[uid]=nil end
+    Parry.dynThreshold=CFG.ScoreThreshold
+    Parry.consecMiss=0
+    Lock.target=nil; Lock.inCombat=false; Lock.combatTime=0
+    DestroyConstraint()
+    task.wait(0.7); WatchAll()
+    task.wait(0.1)
+    if Lock.on then SetupConstraint() end
 end)
 
 Players.PlayerRemoving:Connect(function(p)
-    if AS.Target == p then UnlockAll() end
+    if Lock.target==p then Lock.target=nil; DestroyConstraint() end
 end)
 
-LP.CharacterAdded:Connect(function()
-    UnlockAll(); AS.InCombat=false; AS.IsAtk=false
-    task.wait(0.5); SetupConstraint()
-end)
-
-UIS.InputBegan:Connect(function(i, g)
+UIS.InputBegan:Connect(function(i,g)
     if g then return end
-    if i.KeyCode == ACFG.SwitchKey and ACFG.ON then
-        GetBestTarget(true); SwitchNext()
+    if i.KeyCode==CFG.LockToggleKey then
+        Lock.on=not Lock.on
+        if not Lock.on then
+            Lock.target=nil; Lock.inCombat=false
+            DestroyConstraint()
+        end
+        -- UI update handled below
     end
 end)
 
 -- ============================================================
 --  UI
 -- ============================================================
-local old = PGui:FindFirstChild("CombinedUI_HSA")
+local old=PGui:FindFirstChild("CombinedUI_HSA")
 if old then old:Destroy() end
 
-local SG = Instance.new("ScreenGui")
-SG.Name           = "CombinedUI_HSA"
-SG.ResetOnSpawn   = false
-SG.IgnoreGuiInset = true
-SG.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-SG.Parent         = PGui
+local SG=Instance.new("ScreenGui")
+SG.Name="CombinedUI_HSA"
+SG.ResetOnSpawn=false
+SG.IgnoreGuiInset=true
+SG.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+SG.Parent=PGui
 
-local Panel = Instance.new("Frame")
-Panel.Name                   = "Panel"
-Panel.Size                   = UDim2.new(0,180,0,240)
-Panel.Position               = UDim2.new(0,20,0.5,-120)
-Panel.BackgroundColor3       = Color3.fromRGB(10,10,10)
-Panel.BackgroundTransparency = 0.12
-Panel.BorderSizePixel        = 0
-Panel.Active                 = true
-Panel.Parent                 = SG
-Instance.new("UICorner",Panel).CornerRadius = UDim.new(0,10)
+local Panel=Instance.new("Frame")
+Panel.Name="Panel"
+Panel.Size=UDim2.new(0,185,0,250)
+Panel.Position=UDim2.new(0,20,0.5,-125)
+Panel.BackgroundColor3=Color3.fromRGB(10,10,10)
+Panel.BackgroundTransparency=0.12
+Panel.BorderSizePixel=0
+Panel.Active=true
+Panel.Parent=SG
+Instance.new("UICorner",Panel).CornerRadius=UDim.new(0,10)
 
-local PanelStroke = Instance.new("UIStroke",Panel)
-PanelStroke.Thickness = 1.5
-PanelStroke.Color     = Color3.fromRGB(60,60,60)
+local PanelStroke=Instance.new("UIStroke",Panel)
+PanelStroke.Thickness=1.5
+PanelStroke.Color=Color3.fromRGB(60,60,60)
 
-local Header = Instance.new("Frame")
-Header.Size             = UDim2.new(1,0,0,30)
-Header.BackgroundColor3 = Color3.fromRGB(20,20,20)
-Header.BorderSizePixel  = 0
-Header.Parent           = Panel
-Instance.new("UICorner",Header).CornerRadius = UDim.new(0,10)
+local Header=Instance.new("Frame")
+Header.Size=UDim2.new(1,0,0,30)
+Header.BackgroundColor3=Color3.fromRGB(20,20,20)
+Header.BorderSizePixel=0
+Header.Parent=Panel
+Instance.new("UICorner",Header).CornerRadius=UDim.new(0,10)
 
-local HFix = Instance.new("Frame")
-HFix.Size             = UDim2.new(1,0,0.5,0)
-HFix.Position         = UDim2.new(0,0,0.5,0)
-HFix.BackgroundColor3 = Color3.fromRGB(20,20,20)
-HFix.BorderSizePixel  = 0
-HFix.Parent           = Header
+local HFix=Instance.new("Frame")
+HFix.Size=UDim2.new(1,0,0.5,0)
+HFix.Position=UDim2.new(0,0,0.5,0)
+HFix.BackgroundColor3=Color3.fromRGB(20,20,20)
+HFix.BorderSizePixel=0
+HFix.Parent=Header
 
-local TitleLbl = Instance.new("TextLabel")
-TitleLbl.Text                = "⚔️ HSA TOOLS v2"
-TitleLbl.Size                = UDim2.new(1,-36,1,0)
-TitleLbl.Position            = UDim2.new(0,10,0,0)
-TitleLbl.BackgroundTransparency = 1
-TitleLbl.TextColor3          = Color3.fromRGB(220,220,220)
-TitleLbl.TextSize            = 12
-TitleLbl.Font                = Enum.Font.GothamBold
-TitleLbl.TextXAlignment      = Enum.TextXAlignment.Left
-TitleLbl.Parent              = Header
+local TitleLbl=Instance.new("TextLabel")
+TitleLbl.Text="⚔️ HSA TOOLS v3"
+TitleLbl.Size=UDim2.new(1,-36,1,0)
+TitleLbl.Position=UDim2.new(0,10,0,0)
+TitleLbl.BackgroundTransparency=1
+TitleLbl.TextColor3=Color3.fromRGB(220,220,220)
+TitleLbl.TextSize=12
+TitleLbl.Font=Enum.Font.GothamBold
+TitleLbl.TextXAlignment=Enum.TextXAlignment.Left
+TitleLbl.Parent=Header
 
-local CloseBtn = Instance.new("TextButton")
-CloseBtn.Size             = UDim2.new(0,22,0,22)
-CloseBtn.Position         = UDim2.new(1,-26,0.5,-11)
-CloseBtn.BackgroundColor3 = Color3.fromRGB(35,35,35)
-CloseBtn.Text             = "✕"
-CloseBtn.TextColor3       = Color3.fromRGB(160,160,160)
-CloseBtn.TextSize         = 11
-CloseBtn.Font             = Enum.Font.GothamBold
-CloseBtn.BorderSizePixel  = 0
-CloseBtn.Parent           = Header
-Instance.new("UICorner",CloseBtn).CornerRadius = UDim.new(0,5)
+local CloseBtn=Instance.new("TextButton")
+CloseBtn.Size=UDim2.new(0,22,0,22)
+CloseBtn.Position=UDim2.new(1,-26,0.5,-11)
+CloseBtn.BackgroundColor3=Color3.fromRGB(35,35,35)
+CloseBtn.Text="✕"
+CloseBtn.TextColor3=Color3.fromRGB(160,160,160)
+CloseBtn.TextSize=11
+CloseBtn.Font=Enum.Font.GothamBold
+CloseBtn.BorderSizePixel=0
+CloseBtn.Parent=Header
+Instance.new("UICorner",CloseBtn).CornerRadius=UDim.new(0,5)
 
-local function MakeLabel(text, yPos)
-    local lbl = Instance.new("TextLabel")
-    lbl.Text                   = text
-    lbl.Size                   = UDim2.new(1,-16,0,14)
-    lbl.Position               = UDim2.new(0,8,0,yPos)
-    lbl.BackgroundTransparency = 1
-    lbl.TextColor3             = Color3.fromRGB(100,100,100)
-    lbl.TextSize               = 9
-    lbl.Font                   = Enum.Font.GothamBold
-    lbl.TextXAlignment         = Enum.TextXAlignment.Left
-    lbl.Parent                 = Panel
-    return lbl
+local function MakeLabel(text,yPos)
+    local lbl=Instance.new("TextLabel")
+    lbl.Text=text; lbl.Size=UDim2.new(1,-16,0,14)
+    lbl.Position=UDim2.new(0,8,0,yPos)
+    lbl.BackgroundTransparency=1
+    lbl.TextColor3=Color3.fromRGB(100,100,100)
+    lbl.TextSize=9; lbl.Font=Enum.Font.GothamBold
+    lbl.TextXAlignment=Enum.TextXAlignment.Left
+    lbl.Parent=Panel; return lbl
 end
 
-local function MakeBtn(text, yPos, color)
-    local btn = Instance.new("TextButton")
-    btn.Size             = UDim2.new(1,-16,0,32)
-    btn.Position         = UDim2.new(0,8,0,yPos)
-    btn.BackgroundColor3 = color or Color3.fromRGB(40,40,40)
-    btn.TextColor3       = Color3.fromRGB(255,255,255)
-    btn.TextSize         = 12
-    btn.Font             = Enum.Font.GothamBold
-    btn.Text             = text
-    btn.BorderSizePixel  = 0
-    btn.Parent           = Panel
-    Instance.new("UICorner",btn).CornerRadius = UDim.new(0,7)
+local function MakeBtn(text,yPos,color)
+    local btn=Instance.new("TextButton")
+    btn.Size=UDim2.new(1,-16,0,32)
+    btn.Position=UDim2.new(0,8,0,yPos)
+    btn.BackgroundColor3=color or Color3.fromRGB(40,40,40)
+    btn.TextColor3=Color3.fromRGB(255,255,255)
+    btn.TextSize=12; btn.Font=Enum.Font.GothamBold
+    btn.Text=text; btn.BorderSizePixel=0; btn.Parent=Panel
+    Instance.new("UICorner",btn).CornerRadius=UDim.new(0,7)
     return btn
 end
 
-MakeLabel("— AUTO PARRY —", 36)
-local ParryBtn = MakeBtn("⚔ PARRY: OFF", 52, Color3.fromRGB(180,35,35))
-MakeLabel("— AUTO AIM —", 96)
-local AimBtn   = MakeBtn("🎯 AIM: OFF",  112, Color3.fromRGB(180,35,35))
+MakeLabel("— AUTO PARRY —",36)
+local ParryBtn=MakeBtn("⚔ PARRY: OFF",52,Color3.fromRGB(180,35,35))
+MakeLabel("— SMART LOCK —",96)
+local LockBtn=MakeBtn("🔒 LOCK: OFF",112,Color3.fromRGB(180,35,35))
 
-local TargetLbl = Instance.new("TextLabel")
-TargetLbl.Size                   = UDim2.new(1,-16,0,16)
-TargetLbl.Position               = UDim2.new(0,8,0,155)
-TargetLbl.BackgroundTransparency = 1
-TargetLbl.TextColor3             = Color3.fromRGB(255,200,80)
-TargetLbl.TextSize               = 10
-TargetLbl.Font                   = Enum.Font.Gotham
-TargetLbl.TextXAlignment         = Enum.TextXAlignment.Left
-TargetLbl.Text                   = "Target: -"
-TargetLbl.TextTruncate           = Enum.TextTruncate.AtEnd
-TargetLbl.Parent                 = Panel
+local TargetLbl=Instance.new("TextLabel")
+TargetLbl.Size=UDim2.new(1,-16,0,16)
+TargetLbl.Position=UDim2.new(0,8,0,158)
+TargetLbl.BackgroundTransparency=1
+TargetLbl.TextColor3=Color3.fromRGB(255,200,80)
+TargetLbl.TextSize=10; TargetLbl.Font=Enum.Font.Gotham
+TargetLbl.TextXAlignment=Enum.TextXAlignment.Left
+TargetLbl.Text="Target: -"
+TargetLbl.TextTruncate=Enum.TextTruncate.AtEnd
+TargetLbl.Parent=Panel
 
-local InfoLbl = Instance.new("TextLabel")
-InfoLbl.Size                   = UDim2.new(1,-16,0,14)
-InfoLbl.Position               = UDim2.new(0,8,0,172)
-InfoLbl.BackgroundTransparency = 1
-InfoLbl.TextColor3             = Color3.fromRGB(110,110,110)
-InfoLbl.TextSize               = 9
-InfoLbl.Font                   = Enum.Font.Gotham
-InfoLbl.TextXAlignment         = Enum.TextXAlignment.Left
-InfoLbl.Text                   = "Dist: - | HP: -"
-InfoLbl.Parent                 = Panel
+local InfoLbl=Instance.new("TextLabel")
+InfoLbl.Size=UDim2.new(1,-16,0,14)
+InfoLbl.Position=UDim2.new(0,8,0,175)
+InfoLbl.BackgroundTransparency=1
+InfoLbl.TextColor3=Color3.fromRGB(110,110,110)
+InfoLbl.TextSize=9; InfoLbl.Font=Enum.Font.Gotham
+InfoLbl.TextXAlignment=Enum.TextXAlignment.Left
+InfoLbl.Text="Dist: - | HP: -"
+InfoLbl.Parent=Panel
 
-local StatsLbl = Instance.new("TextLabel")
-StatsLbl.Size                   = UDim2.new(1,-16,0,12)
-StatsLbl.Position               = UDim2.new(0,8,0,188)
-StatsLbl.BackgroundTransparency = 1
-StatsLbl.TextColor3             = Color3.fromRGB(80,80,80)
-StatsLbl.TextSize               = 8
-StatsLbl.Font                   = Enum.Font.Gotham
-StatsLbl.TextXAlignment         = Enum.TextXAlignment.Left
-StatsLbl.Text                   = "Parry:0 Miss:0 Ping:-"
-StatsLbl.Parent                 = Panel
+local StatusLbl=Instance.new("TextLabel")
+StatusLbl.Size=UDim2.new(1,-16,0,14)
+StatusLbl.Position=UDim2.new(0,8,0,190)
+StatusLbl.BackgroundTransparency=1
+StatusLbl.TextColor3=Color3.fromRGB(80,180,80)
+StatusLbl.TextSize=9; StatusLbl.Font=Enum.Font.Gotham
+StatusLbl.TextXAlignment=Enum.TextXAlignment.Left
+StatusLbl.Text="State: Neutral"
+StatusLbl.Parent=Panel
 
-local SwBtn = MakeBtn("🔄 Switch Target", 203, Color3.fromRGB(50,85,180))
+local StatsLbl=Instance.new("TextLabel")
+StatsLbl.Size=UDim2.new(1,-16,0,12)
+StatsLbl.Position=UDim2.new(0,8,0,206)
+StatsLbl.BackgroundTransparency=1
+StatsLbl.TextColor3=Color3.fromRGB(80,80,80)
+StatsLbl.TextSize=8; StatsLbl.Font=Enum.Font.Gotham
+StatsLbl.TextXAlignment=Enum.TextXAlignment.Left
+StatsLbl.Text="Parry:0 Miss:0 Ping:-"
+StatsLbl.Parent=Panel
 
-local ReopenBtn = Instance.new("TextButton")
-ReopenBtn.Size             = UDim2.new(0,38,0,38)
-ReopenBtn.Position         = Panel.Position
-ReopenBtn.BackgroundColor3 = Color3.fromRGB(15,15,15)
-ReopenBtn.Text             = "⚔️"
-ReopenBtn.TextColor3       = Color3.fromRGB(255,255,255)
-ReopenBtn.TextSize         = 18
-ReopenBtn.Font             = Enum.Font.GothamBold
-ReopenBtn.BorderSizePixel  = 0
-ReopenBtn.Visible          = false
-ReopenBtn.Active           = true
-ReopenBtn.Parent           = SG
-Instance.new("UICorner",ReopenBtn).CornerRadius = UDim.new(0,8)
+local ReopenBtn=Instance.new("TextButton")
+ReopenBtn.Size=UDim2.new(0,38,0,38)
+ReopenBtn.Position=Panel.Position
+ReopenBtn.BackgroundColor3=Color3.fromRGB(15,15,15)
+ReopenBtn.Text="⚔️"
+ReopenBtn.TextColor3=Color3.fromRGB(255,255,255)
+ReopenBtn.TextSize=18
+ReopenBtn.Font=Enum.Font.GothamBold
+ReopenBtn.BorderSizePixel=0
+ReopenBtn.Visible=false
+ReopenBtn.Active=true
+ReopenBtn.Parent=SG
+Instance.new("UICorner",ReopenBtn).CornerRadius=UDim.new(0,8)
 
-local RStroke = Instance.new("UIStroke",ReopenBtn)
-RStroke.Thickness = 1.5
-RStroke.Color     = Color3.fromRGB(60,60,60)
+local RStroke=Instance.new("UIStroke",ReopenBtn)
+RStroke.Thickness=1.5
+RStroke.Color=Color3.fromRGB(60,60,60)
 
 -- ============================================================
 --  UI UPDATE
 -- ============================================================
-local UILastUpdate = 0
-
+local UILastUpdate=0
 local function UpdateUI()
+    -- parry button
     if Parry.on then
-        ParryBtn.BackgroundColor3 = Color3.fromRGB(30,160,65)
-        ParryBtn.Text             = "⚔ PARRY: ON"
+        ParryBtn.BackgroundColor3=Color3.fromRGB(30,160,65)
+        ParryBtn.Text="⚔ PARRY: ON"
     else
-        ParryBtn.BackgroundColor3 = Color3.fromRGB(180,35,35)
-        ParryBtn.Text             = "⚔ PARRY: OFF"
+        ParryBtn.BackgroundColor3=Color3.fromRGB(180,35,35)
+        ParryBtn.Text="⚔ PARRY: OFF"
     end
-    if ACFG.ON then
-        AimBtn.BackgroundColor3 = Color3.fromRGB(30,120,200)
-        AimBtn.Text             = "🎯 AIM: ON"
+    -- lock button
+    if Lock.on then
+        LockBtn.BackgroundColor3=Color3.fromRGB(30,120,200)
+        LockBtn.Text="🔒 LOCK: ON"
     else
-        AimBtn.BackgroundColor3 = Color3.fromRGB(180,35,35)
-        AimBtn.Text             = "🎯 AIM: OFF"
+        LockBtn.BackgroundColor3=Color3.fromRGB(80,80,80)
+        LockBtn.Text="🔒 LOCK: OFF"
     end
-    if Parry.on and ACFG.ON then
-        PanelStroke.Color = Color3.fromRGB(0,220,180)
-        RStroke.Color     = Color3.fromRGB(0,220,180)
-    elseif ACFG.ON then
-        PanelStroke.Color = Color3.fromRGB(30,120,200)
-        RStroke.Color     = Color3.fromRGB(30,120,200)
+    -- panel stroke color
+    if Parry.on and Lock.on then
+        PanelStroke.Color=Color3.fromRGB(0,220,180); RStroke.Color=PanelStroke.Color
+    elseif Lock.on then
+        PanelStroke.Color=Color3.fromRGB(30,120,200); RStroke.Color=PanelStroke.Color
     elseif Parry.on then
-        PanelStroke.Color = Color3.fromRGB(30,160,65)
-        RStroke.Color     = Color3.fromRGB(30,160,65)
+        PanelStroke.Color=Color3.fromRGB(30,160,65); RStroke.Color=PanelStroke.Color
     else
-        PanelStroke.Color = Color3.fromRGB(60,60,60)
-        RStroke.Color     = Color3.fromRGB(60,60,60)
+        PanelStroke.Color=Color3.fromRGB(60,60,60); RStroke.Color=PanelStroke.Color
     end
-    if AS.Target and AS.Target.Character then
-        local ec  = AS.Target.Character
-        local er  = ec:FindFirstChild("HumanoidRootPart")
-        local eh  = ec:FindFirstChild("Humanoid")
-        local myR = MyChar.root
-        local dist      = (er and myR) and math.floor(Dist(myR,er)) or 0
-        local hp        = eh and math.floor(eh.Health) or 0
-        local mhp       = eh and math.floor(eh.MaxHealth) or 0
-        local remaining = math.max(0, math.floor(AS.ExpireTime - os.clock()))
-        TargetLbl.Text  = "🎯 "..AS.Target.Name.." ["..remaining.."s]"
-        InfoLbl.Text    = string.format("Dist:%d/%d | HP:%d/%d",
-            dist, ACFG.LeashRange, hp, mhp)
+    -- combat state
+    if Lock.inCombat then
+        StatusLbl.TextColor3=Color3.fromRGB(255,100,100)
+        StatusLbl.Text="State: ⚔ COMBAT"
     else
-        TargetLbl.Text = "Target: -"
-        InfoLbl.Text   = "Dist: - | HP: -"
+        StatusLbl.TextColor3=Color3.fromRGB(80,180,80)
+        StatusLbl.Text="State: Neutral"
     end
-    StatsLbl.Text = string.format("Parry:%d Miss:%d Ping:%dms | Rate:%d/s",
+    -- target info
+    if Lock.target and Lock.target.Character then
+        local ec=Lock.target.Character
+        local er=ec:FindFirstChild("HumanoidRootPart")
+        local eh=ec:FindFirstChild("Humanoid")
+        local myR=MC.root
+        local dist=(er and myR) and math.floor(Dist(myR,er)) or 0
+        local hp=eh and math.floor(eh.Health) or 0
+        local mhp=eh and math.floor(eh.MaxHealth) or 0
+        local remain=math.max(0,math.floor(Lock.expireTime-os.clock()))
+        TargetLbl.Text="🎯 "..Lock.target.Name.." ["..remain.."s]"
+        InfoLbl.Text=string.format("Dist:%d | HP:%d/%d",dist,hp,mhp)
+    else
+        TargetLbl.Text="Target: -"; InfoLbl.Text="Dist: - | HP: -"
+    end
+    StatsLbl.Text=string.format("Parry:%d Miss:%d Ping:%dms | CPS:%d",
         Parry.parryCount, Parry.missCount,
-        math.floor(Ping:get()), #RateLimiter.calls)
+        math.floor(Ping:get()), #RL.calls)
 end
 
 RunService.RenderStepped:Connect(function()
     if not Panel.Visible then return end
-    local now = os.clock()
-    if now - UILastUpdate < 0.33 then return end
-    UILastUpdate = now
+    local now=os.clock()
+    if now-UILastUpdate<0.3 then return end
+    UILastUpdate=now
     UpdateUI()
 end)
 
@@ -1361,106 +1337,101 @@ end)
 --  BUTTON CALLBACKS
 -- ============================================================
 local function TweenPop(btn)
-    TweenService:Create(btn, TweenInfo.new(0.07), {Size=UDim2.new(1,-22,0,28)}):Play()
+    TweenService:Create(btn,TweenInfo.new(0.07),{Size=UDim2.new(1,-22,0,28)}):Play()
     task.wait(0.07)
-    TweenService:Create(btn, TweenInfo.new(0.07), {Size=UDim2.new(1,-16,0,32)}):Play()
+    TweenService:Create(btn,TweenInfo.new(0.07),{Size=UDim2.new(1,-16,0,32)}):Play()
 end
 
 ParryBtn.MouseButton1Click:Connect(function()
-    Parry.on       = not Parry.on
-    Parry.nextFire = 0
-    Parry.firing   = false
+    Parry.on=not Parry.on
+    Parry.nextFire=0; Parry.firing=false; Parry.spamActive=false
     TweenPop(ParryBtn); UpdateUI()
 end)
 
-AimBtn.MouseButton1Click:Connect(function()
-    ACFG.ON = not ACFG.ON
-    if not ACFG.ON then UnlockAll() end
-    TweenPop(AimBtn); UpdateUI()
+LockBtn.MouseButton1Click:Connect(function()
+    Lock.on=not Lock.on
+    if not Lock.on then
+        Lock.target=nil; Lock.inCombat=false
+        DestroyConstraint()
+    end
+    TweenPop(LockBtn); UpdateUI()
 end)
 
-SwBtn.MouseButton1Click:Connect(function()
-    if not ACFG.ON then return end
-    GetBestTarget(true); SwitchNext()
-    TweenService:Create(SwBtn, TweenInfo.new(0.07),
-        {BackgroundColor3=Color3.fromRGB(90,130,255)}):Play()
-    task.wait(0.15)
-    TweenService:Create(SwBtn, TweenInfo.new(0.07),
-        {BackgroundColor3=Color3.fromRGB(50,85,180)}):Play()
+UIS.InputBegan:Connect(function(i,g)
+    if g then return end
+    if i.KeyCode==CFG.ParryToggleKey then
+        Parry.on=not Parry.on
+        Parry.nextFire=0; Parry.firing=false; Parry.spamActive=false
+        UpdateUI()
+    end
+    if i.KeyCode==CFG.LockToggleKey then
+        Lock.on=not Lock.on
+        if not Lock.on then
+            Lock.target=nil; Lock.inCombat=false; DestroyConstraint()
+        end
+        UpdateUI()
+    end
 end)
 
-local savedPanelPos = Panel.Position
+local savedPanelPos=Panel.Position
 
 CloseBtn.MouseButton1Click:Connect(function()
-    savedPanelPos = Panel.Position
+    savedPanelPos=Panel.Position
     TweenService:Create(Panel,
-        TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
-        {Size=UDim2.new(0,0,0,0), Position=UDim2.new(
-            savedPanelPos.X.Scale, savedPanelPos.X.Offset+90,
-            savedPanelPos.Y.Scale, savedPanelPos.Y.Offset+120)}):Play()
+        TweenInfo.new(0.12,Enum.EasingStyle.Quad,Enum.EasingDirection.In),
+        {Size=UDim2.new(0,0,0,0),Position=UDim2.new(
+            savedPanelPos.X.Scale,savedPanelPos.X.Offset+92,
+            savedPanelPos.Y.Scale,savedPanelPos.Y.Offset+125)}):Play()
     task.wait(0.13)
-    Panel.Visible     = false
-    Panel.Size        = UDim2.new(0,180,0,240)
-    Panel.Position    = savedPanelPos
-    ReopenBtn.Visible = true
-    ReopenBtn.Position = savedPanelPos
+    Panel.Visible=false
+    Panel.Size=UDim2.new(0,185,0,250)
+    Panel.Position=savedPanelPos
+    ReopenBtn.Visible=true
+    ReopenBtn.Position=savedPanelPos
 end)
 
 ReopenBtn.MouseButton1Click:Connect(function()
-    Panel.Position = savedPanelPos
-    Panel.Visible  = true
-    Panel.Size     = UDim2.new(0,0,0,0)
-    ReopenBtn.Visible = false
+    Panel.Position=savedPanelPos
+    Panel.Visible=true
+    Panel.Size=UDim2.new(0,0,0,0)
+    ReopenBtn.Visible=false
     TweenService:Create(Panel,
-        TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-        {Size=UDim2.new(0,180,0,240)}):Play()
+        TweenInfo.new(0.12,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),
+        {Size=UDim2.new(0,185,0,250)}):Play()
 end)
 
-UIS.InputBegan:Connect(function(i, g)
-    if g then return end
-    if i.KeyCode == PCFG.ToggleKey then
-        Parry.on=not Parry.on; Parry.nextFire=0; Parry.firing=false; UpdateUI()
-    end
-    if i.KeyCode == ACFG.ToggleKey then
-        ACFG.ON = not ACFG.ON
-        if not ACFG.ON then UnlockAll() end; UpdateUI()
-    end
-end)
-
-local function MakeDraggable(handle, target)
-    local dragging, dragStart, startPos = false, nil, nil
+local function MakeDraggable(handle,target)
+    local dragging,dragStart,startPos=false,nil,nil
     handle.InputBegan:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.Touch
-        or i.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging  = true
-            dragStart = i.Position
-            startPos  = target.Position
+        if i.UserInputType==Enum.UserInputType.Touch
+        or i.UserInputType==Enum.UserInputType.MouseButton1 then
+            dragging=true; dragStart=i.Position; startPos=target.Position
             i.Changed:Connect(function()
-                if i.UserInputState == Enum.UserInputState.End then dragging=false end
+                if i.UserInputState==Enum.UserInputState.End then dragging=false end
             end)
         end
     end)
     UIS.InputChanged:Connect(function(i)
         if not dragging then return end
-        if i.UserInputType == Enum.UserInputType.MouseMovement
-        or i.UserInputType == Enum.UserInputType.Touch then
-            local d = i.Position - dragStart
-            target.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + d.X,
-                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        if i.UserInputType==Enum.UserInputType.MouseMovement
+        or i.UserInputType==Enum.UserInputType.Touch then
+            local d=i.Position-dragStart
+            target.Position=UDim2.new(
+                startPos.X.Scale,startPos.X.Offset+d.X,
+                startPos.Y.Scale,startPos.Y.Offset+d.Y)
         end
     end)
     UIS.InputEnded:Connect(function(i)
-        if i.UserInputType == Enum.UserInputType.MouseButton1
-        or i.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-            if target == Panel then savedPanelPos = Panel.Position end
+        if i.UserInputType==Enum.UserInputType.MouseButton1
+        or i.UserInputType==Enum.UserInputType.Touch then
+            dragging=false
+            if target==Panel then savedPanelPos=Panel.Position end
         end
     end)
 end
 
-MakeDraggable(Header, Panel)
-MakeDraggable(ReopenBtn, ReopenBtn)
+MakeDraggable(Header,Panel)
+MakeDraggable(ReopenBtn,ReopenBtn)
 
 UpdateUI()
-print("[HSA Combat Tools v2.0 UNDETECTED] Loaded — RShift=Parry | RCtrl=Aim")
+print("[HSA Combat Tools v3.0] — RShift=Parry | RCtrl=Lock | Perfect Parry + Smart Combat Lock")
