@@ -1,15 +1,25 @@
 -- ============================================================
 --  HIGH SCHOOL ANIME — Combat Tools v9.1 SPECTER
---  Rebuilt + Upgraded by Nono
+--  by spraxy / VANTA  (rebuilt + upgraded by Nono)
 --
---  NEW in v9.1:
---  · Auto Block Fallback: jika parry tidak trigger dalam window,
---    otomatis FireServer(true) untuk hold block — nahan damage
---  · Parry tetap prioritas, block hanya fallback layer
---  · Lock Neutral: lock reset ke idle jika tidak ada hit exchange
---    dalam threshold waktu (HIT_EXCHANGE_TTL)
---  · Combat Lock: lock hanya aktif saat hit terjadi (in/out)
---  · Block release timer: block otomatis lepas setelah window
+--  v9 ANTI-DETECT CORE:
+--  · Human reaction delay gate: 80–220ms before first fire
+--  · Interval variance per tap: no two taps same duration
+--  · Burst size randomized 3–8: no fixed pattern fingerprint
+--  · Gamma-distributed inter-burst gap (human fatigue model)
+--  · Single priority path: anim > attr > HB
+--  · Per-enemy 95ms reaction gate
+--  · Remote name rotates every 75–110s
+--  · Decoy fires full human-timed press→release sequences
+--
+--  v9.1 NEW:
+--  · Auto Block Fallback — block otomatis saat parry miss
+--  · Combat Lock Neutral — lock reset saat idle (no exchange)
+--  · Combat Lock Active  — lock hanya aktif saat hit exchange
+--  · HP Watch            — incoming hit detection via HP drop
+--  · Outgoing Watch      — detect saat kita ngehit
+--  · Full Status UI      — realtime panel kiri tengah
+--  · Nil guard Heartbeat — fix "attempt to index nil with 'on'"
 -- ============================================================
 
 local Players      = game:GetService("Players")
@@ -46,7 +56,7 @@ local KOFX         = WR("KOFX")
 if not RequestBlock then warn("[HSA] RequestBlock missing"); return end
 
 -- ============================================================
---  RANDOM NAME — rotates every 75–110s
+--  RANDOM NAME — rotates every 75–110s (anti-detect)
 -- ============================================================
 local _NC = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 local function RandName(len)
@@ -83,8 +93,8 @@ RunService.Heartbeat:Connect(function(dt)
     if now - FPS.lastT > 0.35 then
         local sum = 0
         for _,s in ipairs(FPS.samples) do sum=sum+s end
-        FPS.frametime = sum/#FPS.samples
-        FPS.current   = math.floor(1/math.max(FPS.frametime,0.001))
+        FPS.frametime = sum / #FPS.samples
+        FPS.current   = math.floor(1 / math.max(FPS.frametime, 0.001))
         FPS.lastT     = now
     end
 end)
@@ -106,7 +116,7 @@ function Ping:update()
         if #self.samples > self.maxSamp then table.remove(self.samples,1) end
         local sum = 0
         for _,s in ipairs(self.samples) do sum=sum+s end
-        self.current = sum/#self.samples
+        self.current = sum / #self.samples
     end
 end
 
@@ -124,14 +134,14 @@ function Ping:cd(heavy)
 end
 
 -- ============================================================
---  MATH — lognormal + gamma
+--  MATH — lognormal + gamma (human timing models)
 -- ============================================================
-local _TWO_PI = 2*math.pi
+local _TWO_PI = 2 * math.pi
 
 local function _gauss()
     local u1 = math.max(1e-12, math.random())
     local u2 = math.random()
-    return math.sqrt(-2*math.log(u1)) * math.cos(_TWO_PI*u2)
+    return math.sqrt(-2 * math.log(u1)) * math.cos(_TWO_PI * u2)
 end
 
 local function LogN(mu, sigma, lo, hi)
@@ -162,145 +172,14 @@ end
 
 local function ReactionDelay(isHeavy)
     if isHeavy then
-        return LogN(-2.41, 0.30, 0.045, 0.110)
+        return LogN(-2.41, 0.30, 0.045, 0.110)  -- 45–110ms
     else
-        return LogN(-1.90, 0.28, 0.080, 0.220)
+        return LogN(-1.90, 0.28, 0.080, 0.220)  -- 80–220ms
     end
 end
 
 -- ============================================================
---  NEW v9.1 — AUTO BLOCK FALLBACK SYSTEM
---  Priority: Parry > AutoBlock
---  Block hanya aktif ketika parry window missed
---  Block hold lognormal: manusiawi, bukan robot-constant
--- ============================================================
-local AutoBlock = {
-    active      = false,   -- apakah block sedang hold
-    holdUntil   = 0,       -- kapan block dilepas
-    fallbackArmed = false, -- sudah arm untuk fire fallback?
-    armTime     = 0,       -- kapan fallback di-arm
-    armTTL      = 0.18,    -- berapa lama arm sebelum fire (window)
-    cooldown    = 0,       -- cooldown antar block
-    cdDuration  = 0.22,    -- min gap antar block fire
-}
-
--- Arm fallback: dipanggil saat ancaman terdeteksi
--- Jika dalam armTTL parry tidak fire, block otomatis turun
-function AutoBlock:arm(isHeavy)
-    if self.active then return end -- sudah block, skip
-    if os.clock() < self.cooldown then return end
-    self.fallbackArmed = true
-    self.armTime       = os.clock()
-    -- Heavy attack = arm lebih cepat (ancaman lebih serius)
-    self.armTTL        = isHeavy and 0.10 or 0.18
-end
-
--- Disarm: dipanggil saat parry berhasil fire
--- Jadi block fallback tidak dobel dengan parry
-function AutoBlock:disarm()
-    self.fallbackArmed = false
-    self.active        = false
-    self.holdUntil     = 0
-end
-
--- Tick: dipanggil tiap frame
--- Cek apakah perlu fire block, atau lepas block
-function AutoBlock:tick()
-    local now = os.clock()
-
-    -- Lepas block kalau sudah habis waktunya
-    if self.active and now >= self.holdUntil then
-        pcall(function() RequestBlock:FireServer(false) end)
-        self.active    = false
-        self.cooldown  = now + self.cdDuration
-        return
-    end
-
-    -- Fire block fallback jika arm sudah lewat window
-    if self.fallbackArmed and not self.active then
-        if now - self.armTime >= self.armTTL then
-            -- Parry tidak fire dalam window → turunkan block
-            if RL:ok() then
-                local react = ReactionDelay(false) * 0.5
-                task.delay(react, function()
-                    if self.fallbackArmed and not self.active then
-                        pcall(function()
-                            RequestBlock:FireServer(true)
-                            RL:mark()
-                        end)
-                        -- Hold block selama window lognormal (manusiawi)
-                        self.active        = true
-                        self.holdUntil     = os.clock() + LogN(-1.60, 0.25, 0.12, 0.38)
-                        self.fallbackArmed = false
-                    end
-                end)
-            end
-        end
-    end
-end
-
--- ============================================================
---  NEW v9.1 — COMBAT LOCK / NEUTRAL LOGIC
---
---  Lock NEUTRAL: lock reset ke idle jika tidak ada
---  hit exchange dalam HIT_EXCHANGE_TTL detik
---
---  Lock ACTIVE: lock aktif hanya ketika:
---    · Kita kena hit (incoming damage)
---    · Kita ngehit musuh (outgoing hit confirmed)
---
---  Ini mencegah lock "nempel terus" ke musuh yang
---  sudah tidak aktif, dan membuatnya lebih natural
--- ============================================================
-local HIT_EXCHANGE_TTL = 3.2  -- detik tanpa exchange → neutral
-
-local CombatLock = {
-    active          = false,
-    lastExchangeT   = 0,   -- kapan terakhir ada hit exchange
-    incomingHit     = false,
-    outgoingHit     = false,
-}
-
--- Dipanggil saat kita kena hit
-function CombatLock:onIncoming()
-    self.incomingHit   = true
-    self.lastExchangeT = os.clock()
-    self.active        = true
-end
-
--- Dipanggil saat kita ngehit musuh
-function CombatLock:onOutgoing()
-    self.outgoingHit   = true
-    self.lastExchangeT = os.clock()
-    self.active        = true
-end
-
--- Dipanggil tiap frame — cek apakah harus neutral
-function CombatLock:tick()
-    if not self.active then return end
-    local now = os.clock()
-    if now - self.lastExchangeT > HIT_EXCHANGE_TTL then
-        -- Tidak ada exchange cukup lama → neutral
-        self.active      = false
-        self.incomingHit = false
-        self.outgoingHit = false
-        -- Reset lock target ke neutral state
-        Lock.on        = false
-        Lock.target    = nil
-        Lock.inCombat  = false
-        if Lock.alignOri then
-            pcall(function() Lock.alignOri:Destroy() end)
-            Lock.alignOri = nil
-        end
-        if Lock.att0 then
-            pcall(function() Lock.att0:Destroy() end)
-            Lock.att0 = nil
-        end
-    end
-end
-
--- ============================================================
---  DYNAMIC RATE CAP
+--  DYNAMIC RATE CAP — floor 4, ceiling 12
 -- ============================================================
 local DynRL = {
     floor=4, ceiling=12, current=6,
@@ -369,8 +248,8 @@ local M1_KW = {
 }
 local KO_ATTRS = { "IsKO","IsBeingCarried","IsBeingFinished","IsWakingUp" }
 
-local M2_ATTR_SET = {}; for _,k in ipairs(M2_ATTR)  do M2_ATTR_SET[k]=true end
-local M2_KW_SET   = {}; for _,k in ipairs(M2_KW)    do M2_KW_SET[k]=true   end
+local M2_ATTR_SET = {}; for _,k in ipairs(M2_ATTR) do M2_ATTR_SET[k]=true end
+local M2_KW_SET   = {}; for _,k in ipairs(M2_KW)   do M2_KW_SET[k]=true   end
 
 -- ============================================================
 --  CHAR REF
@@ -426,9 +305,9 @@ local function KalmanUpdate(ps, pos, now)
         local alpha  = math.clamp(0.52-(Ping:get()-60)/2000, 0.22, 0.68)
         local newVel = ps.kalmanVel:Lerp(rawVel, alpha)
         local rawAcc = (newVel - ps.kalmanVel)/dt
-        ps.kalmanAcc     = ps.kalmanAcc:Lerp(rawAcc, 0.22)
-        ps.kalmanVel     = newVel
-        ps.isJumping     = newVel.Y > 10
+        ps.kalmanAcc = ps.kalmanAcc:Lerp(rawAcc, 0.22)
+        ps.kalmanVel = newVel
+        ps.isJumping = newVel.Y > 10
     end
     ps.kalmanPos = pos
 end
@@ -464,6 +343,113 @@ local Lock = {
 }
 
 local LOCK_SWITCH_HYSTERESIS = 22
+
+-- ============================================================
+--  AUTO BLOCK FALLBACK — v9.1
+--  Priority: Parry > AutoBlock
+--  Block turun hanya kalau parry ga fire dalam armTTL window
+-- ============================================================
+local AutoBlock = {
+    active        = false,
+    holdUntil     = 0,
+    fallbackArmed = false,
+    armTime       = 0,
+    armTTL        = 0.18,
+    cooldown      = 0,
+    cdDuration    = 0.22,
+}
+
+function AutoBlock:arm(isHeavy)
+    if self.active then return end
+    if os.clock() < self.cooldown then return end
+    self.fallbackArmed = true
+    self.armTime       = os.clock()
+    self.armTTL        = isHeavy and 0.10 or 0.18
+end
+
+function AutoBlock:disarm()
+    self.fallbackArmed = false
+    self.active        = false
+    self.holdUntil     = 0
+end
+
+function AutoBlock:tick()
+    if not self then return end
+    local now = os.clock()
+
+    if self.active and now >= self.holdUntil then
+        pcall(function() RequestBlock:FireServer(false) end)
+        self.active   = false
+        self.cooldown = now + self.cdDuration
+        return
+    end
+
+    if self.fallbackArmed and not self.active then
+        if now - self.armTime >= self.armTTL then
+            if RL:ok() then
+                local react = ReactionDelay(false) * 0.5
+                task.delay(react, function()
+                    if self.fallbackArmed and not self.active then
+                        pcall(function()
+                            RequestBlock:FireServer(true)
+                            RL:mark()
+                        end)
+                        self.active        = true
+                        self.holdUntil     = os.clock() + LogN(-1.60, 0.25, 0.12, 0.38)
+                        self.fallbackArmed = false
+                    end
+                end)
+            end
+        end
+    end
+end
+
+-- ============================================================
+--  COMBAT LOCK / NEUTRAL — v9.1
+--  Lock NEUTRAL jika tidak ada hit exchange > HIT_EXCHANGE_TTL
+--  Lock ACTIVE hanya saat incoming atau outgoing hit
+-- ============================================================
+local HIT_EXCHANGE_TTL = 3.2
+
+local CombatLock = {
+    active        = false,
+    lastExchangeT = 0,
+    incomingHit   = false,
+    outgoingHit   = false,
+}
+
+function CombatLock:onIncoming()
+    self.incomingHit   = true
+    self.lastExchangeT = os.clock()
+    self.active        = true
+end
+
+function CombatLock:onOutgoing()
+    self.outgoingHit   = true
+    self.lastExchangeT = os.clock()
+    self.active        = true
+end
+
+function CombatLock:tick()
+    if not self or not self.active then return end
+    local now = os.clock()
+    if now - self.lastExchangeT > HIT_EXCHANGE_TTL then
+        self.active      = false
+        self.incomingHit = false
+        self.outgoingHit = false
+        Lock.on          = false
+        Lock.target      = nil
+        Lock.inCombat    = false
+        if Lock.alignOri then
+            pcall(function() Lock.alignOri:Destroy() end)
+            Lock.alignOri = nil
+        end
+        if Lock.att0 then
+            pcall(function() Lock.att0:Destroy() end)
+            Lock.att0 = nil
+        end
+    end
+end
 
 -- ============================================================
 --  HELPERS
@@ -534,7 +520,7 @@ local function CheckNeutral()
 end
 
 -- ============================================================
---  SCORE SYSTEM v9.1 — threshold 3
+--  SCORE SYSTEM v9.1 — threshold 3, cache 4ms
 -- ============================================================
 local SCORE_TTL = 0.004
 
@@ -599,11 +585,11 @@ local function Score(p,ps)
                     if IsM2Anim(n) then
                         hvy=true
                         sc=sc+(pos<=0.02 and 95 or pos<=0.05 and 88 or
-                               pos<0.15 and 70 or 52)
+                               pos<0.15  and 70 or 52)
                         break
                     elseif IsM1Anim(n) then
                         sc=sc+(pos<=0.02 and 85 or pos<=0.04 and 70 or
-                               pos<0.12 and 56 or 36)
+                               pos<0.12  and 56 or 36)
                         break
                     end
                 end
@@ -638,7 +624,7 @@ local function Score(p,ps)
 end
 
 -- ============================================================
---  ANIM WINDOW PREDICTOR
+--  ANIM WINDOW PREDICTOR — 15% mark
 -- ============================================================
 local function AnimWindowPredict(track)
     if not track or not track.IsPlaying then return 0 end
@@ -650,7 +636,7 @@ local function AnimWindowPredict(track)
 end
 
 -- ============================================================
---  DECOY
+--  DECOY — full human-timed sequences
 -- ============================================================
 local Decoy = { nextT=0, nextSeqT=0 }
 
@@ -679,8 +665,8 @@ function Decoy:tick()
                 task.wait(react)
                 if not RL:ok() then return end
                 RequestBlock:FireServer(true); RL:mark()
-                local hold = LogN(-2.90, 0.18, 0.055, 0.160)
-                task.wait(hold)
+                local tap = LogN(-2.90, 0.18, 0.055, 0.160)
+                task.wait(tap)
                 if RL:ok() then RequestBlock:FireServer(false); RL:mark() end
             end)
         end)
@@ -689,53 +675,15 @@ function Decoy:tick()
 end
 
 -- ============================================================
---  HP WATCH — deteksi incoming hit via HP turun
---  v9.1: trigger CombatLock:onIncoming() saat HP drop
--- ============================================================
-local HPWatch = {
-    lastHP   = nil,
-    lastHum  = nil,
-}
-
-local function SetupHPWatch()
-    local hum = MC.hum
-    if not hum or hum == HPWatch.lastHum then return end
-    HPWatch.lastHum = hum
-    HPWatch.lastHP  = hum.Health
-
-    hum:GetPropertyChangedSignal("Health"):Connect(function()
-        local cur = hum.Health
-        local prev = HPWatch.lastHP or cur
-        if cur < prev then
-            -- HP turun = kita kena hit
-            CombatLock:onIncoming()
-            -- Arm auto block (kalau parry ga tangkep)
-            AutoBlock:arm(false)
-            MarkCombat()
-        end
-        HPWatch.lastHP = cur
-    end)
-end
-
-LP.CharacterAdded:Connect(function()
-    task.wait(0.1)
-    RefreshChar()
-    SetupHPWatch()
-end)
-
--- ============================================================
---  PARRY FIRE — v9.1: disarm block fallback saat parry fire
+--  PARRY FIRE — disarm block fallback saat parry fire
 -- ============================================================
 local function FireParry(uid, isHeavy, ps)
     local now = os.clock()
-
-    -- Per-enemy gate
     if now - ps.lastFireT < 0.095 then return end
     ps.lastFireT = now
-
     if not RL:ok() then return end
 
-    -- DISARM block fallback — parry yang handle, bukan block
+    -- Parry priority: disarm block fallback dulu
     AutoBlock:disarm()
 
     local delay = ReactionDelay(isHeavy)
@@ -746,7 +694,6 @@ local function FireParry(uid, isHeavy, ps)
             RL:mark()
             Parry.parryCount = Parry.parryCount + 1
         end)
-        -- Release setelah window parry
         local hold = isHeavy and
             LogN(-2.75, 0.18, 0.055, 0.150) or
             LogN(-2.90, 0.15, 0.040, 0.130)
@@ -762,20 +709,37 @@ local function FireParry(uid, isHeavy, ps)
 end
 
 -- ============================================================
---  OUTGOING HIT DETECTION
---  v9.1: deteksi saat kita ngehit — trigger CombatLock
---  Cek via attribute IsPunching, dll yang flip ke true
+--  HP WATCH — detect incoming hit via HP drop
 -- ============================================================
-local OutgoingWatch = { lastAtks={} }
+local HPWatch = { lastHP=nil, lastHum=nil }
 
+local function SetupHPWatch()
+    local hum = MC.hum
+    if not hum or hum == HPWatch.lastHum then return end
+    HPWatch.lastHum = hum
+    HPWatch.lastHP  = hum.Health
+
+    hum:GetPropertyChangedSignal("Health"):Connect(function()
+        local cur  = hum.Health
+        local prev = HPWatch.lastHP or cur
+        if cur < prev then
+            CombatLock:onIncoming()
+            AutoBlock:arm(false)
+            MarkCombat()
+        end
+        HPWatch.lastHP = cur
+    end)
+end
+
+-- ============================================================
+--  OUTGOING HIT WATCH — detect saat kita ngehit
+-- ============================================================
 local function WatchOutgoing(char)
     if not char then return end
     for _,attrName in ipairs(SELF_ATKS) do
         char:GetAttributeChangedSignal(attrName):Connect(function()
             local v = char:GetAttribute(attrName)
             if v == true then
-                -- kita lagi menyerang = potensi outgoing hit
-                -- lock aktif
                 CombatLock:onOutgoing()
                 MarkCombat()
             end
@@ -783,13 +747,199 @@ local function WatchOutgoing(char)
     end
 end
 
-LP.CharacterAdded:Connect(function(c)
-    task.wait(0.12)
-    WatchOutgoing(c)
-end)
+-- ============================================================
+--  UI — STATUS PANEL
+-- ============================================================
+local function BuildUI()
+    local old = PGui:FindFirstChild("HSA_UI")
+    if old then old:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name           = "HSA_UI"
+    sg.ResetOnSpawn   = false
+    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    sg.IgnoreGuiInset = true
+    sg.Parent         = PGui
+
+    -- Panel
+    local frame = Instance.new("Frame")
+    frame.Name                   = "Panel"
+    frame.Size                   = UDim2.new(0, 210, 0, 158)
+    frame.Position               = UDim2.new(0, 12, 0.5, -79)
+    frame.BackgroundColor3       = Color3.fromRGB(8, 8, 8)
+    frame.BackgroundTransparency = 0.30
+    frame.BorderSizePixel        = 0
+    frame.Parent                 = sg
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+    -- Stroke
+    local stroke = Instance.new("UIStroke")
+    stroke.Color     = Color3.fromRGB(255, 200, 50)
+    stroke.Thickness = 1.2
+    stroke.Transparency = 0.55
+    stroke.Parent    = frame
+
+    -- Title bar
+    local title = Instance.new("TextLabel")
+    title.Size             = UDim2.new(1, 0, 0, 26)
+    title.Position         = UDim2.new(0, 0, 0, 0)
+    title.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+    title.BackgroundTransparency = 0.15
+    title.BorderSizePixel  = 0
+    title.Text             = "⚔  HSA v9.1 SPECTER"
+    title.TextColor3       = Color3.fromRGB(255, 200, 50)
+    title.TextSize         = 13
+    title.Font             = Enum.Font.GothamBold
+    title.Parent           = frame
+    Instance.new("UICorner", title).CornerRadius = UDim.new(0, 10)
+
+    -- Divider
+    local div = Instance.new("Frame")
+    div.Size                   = UDim2.new(0.88, 0, 0, 1)
+    div.Position               = UDim2.new(0.06, 0, 0, 28)
+    div.BackgroundColor3       = Color3.fromRGB(255,200,50)
+    div.BackgroundTransparency = 0.7
+    div.BorderSizePixel        = 0
+    div.Parent                 = frame
+
+    -- Row helper
+    local function MakeRow(yPos, icon, labelText, defaultVal, color)
+        local row = Instance.new("Frame")
+        row.Size                  = UDim2.new(1, -18, 0, 21)
+        row.Position              = UDim2.new(0, 9, 0, yPos)
+        row.BackgroundTransparency= 1
+        row.Parent                = frame
+
+        local ico = Instance.new("TextLabel")
+        ico.Size             = UDim2.new(0, 20, 1, 0)
+        ico.BackgroundTransparency = 1
+        ico.Text             = icon
+        ico.TextColor3       = Color3.fromRGB(255,200,50)
+        ico.TextSize         = 13
+        ico.Font             = Enum.Font.Gotham
+        ico.TextXAlignment   = Enum.TextXAlignment.Left
+        ico.Parent           = row
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size             = UDim2.new(0.5, 0, 1, 0)
+        lbl.Position         = UDim2.new(0, 22, 0, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text             = labelText
+        lbl.TextColor3       = Color3.fromRGB(160, 160, 160)
+        lbl.TextSize         = 12
+        lbl.Font             = Enum.Font.Gotham
+        lbl.TextXAlignment   = Enum.TextXAlignment.Left
+        lbl.Parent           = row
+
+        local val = Instance.new("TextLabel")
+        val.Name             = "Val"
+        val.Size             = UDim2.new(0.38, 0, 1, 0)
+        val.Position         = UDim2.new(0.62, 0, 0, 0)
+        val.BackgroundTransparency = 1
+        val.Text             = defaultVal
+        val.TextColor3       = color or Color3.fromRGB(100,220,100)
+        val.TextSize         = 12
+        val.Font             = Enum.Font.GothamBold
+        val.TextXAlignment   = Enum.TextXAlignment.Right
+        val.Parent           = row
+
+        return val
+    end
+
+    local R_Parry  = MakeRow(34,  "◈", "Parry",    "OFF",    Color3.fromRGB(200,80,80))
+    local R_Block  = MakeRow(57,  "⬡", "AutoBlk",  "IDLE",   Color3.fromRGB(140,140,140))
+    local R_Lock   = MakeRow(80,  "◎", "Lock",     "IDLE",   Color3.fromRGB(140,140,140))
+    local R_Exch   = MakeRow(103, "↯", "Exchange", "NONE",   Color3.fromRGB(140,140,140))
+    local R_Ping   = MakeRow(126, "◉", "Ping",     "—ms",    Color3.fromRGB(180,180,180))
+    local R_Rate   = MakeRow(146, "⧖", "Rate",     "0/6",    Color3.fromRGB(180,180,180))
+
+    -- Watermark
+    local wm = Instance.new("TextLabel")
+    wm.Size             = UDim2.new(1, -8, 0, 14)
+    wm.Position         = UDim2.new(0, 4, 1, -16)
+    wm.BackgroundTransparency = 1
+    wm.Text             = "by Nono | discord.gg/nullstate"
+    wm.TextColor3       = Color3.fromRGB(80,80,80)
+    wm.TextSize         = 10
+    wm.Font             = Enum.Font.Gotham
+    wm.TextXAlignment   = Enum.TextXAlignment.Center
+    wm.Parent           = frame
+
+    -- Update loop
+    RunService.Heartbeat:Connect(function()
+        -- Parry
+        if Parry and Parry.on then
+            R_Parry.Text       = "ON"
+            R_Parry.TextColor3 = Color3.fromRGB(80,255,120)
+        else
+            R_Parry.Text       = "OFF"
+            R_Parry.TextColor3 = Color3.fromRGB(200,80,80)
+        end
+
+        -- AutoBlock
+        if AutoBlock then
+            if AutoBlock.active then
+                R_Block.Text       = "HOLD"
+                R_Block.TextColor3 = Color3.fromRGB(80,180,255)
+            elseif AutoBlock.fallbackArmed then
+                R_Block.Text       = "ARM"
+                R_Block.TextColor3 = Color3.fromRGB(255,200,50)
+            else
+                R_Block.Text       = "IDLE"
+                R_Block.TextColor3 = Color3.fromRGB(140,140,140)
+            end
+        end
+
+        -- Lock
+        if Lock then
+            if Lock.on then
+                R_Lock.Text       = "LOCKED"
+                R_Lock.TextColor3 = Color3.fromRGB(255,80,80)
+            elseif CombatLock and CombatLock.active then
+                R_Lock.Text       = "COMBAT"
+                R_Lock.TextColor3 = Color3.fromRGB(255,180,60)
+            else
+                R_Lock.Text       = "IDLE"
+                R_Lock.TextColor3 = Color3.fromRGB(140,140,140)
+            end
+        end
+
+        -- Exchange
+        if CombatLock then
+            if CombatLock.incomingHit and CombatLock.outgoingHit then
+                R_Exch.Text       = "2-WAY"
+                R_Exch.TextColor3 = Color3.fromRGB(255,100,100)
+            elseif CombatLock.incomingHit then
+                R_Exch.Text       = "IN"
+                R_Exch.TextColor3 = Color3.fromRGB(255,150,50)
+            elseif CombatLock.outgoingHit then
+                R_Exch.Text       = "OUT"
+                R_Exch.TextColor3 = Color3.fromRGB(100,220,100)
+            else
+                R_Exch.Text       = "NONE"
+                R_Exch.TextColor3 = Color3.fromRGB(100,100,100)
+            end
+        end
+
+        -- Ping
+        R_Ping.Text = math.floor(Ping:get()) .. "ms"
+
+        -- Rate
+        local cur = RL:count()
+        local cap = DynRL:cap()
+        R_Rate.Text = cur .. "/" .. cap
+        if cur >= cap then
+            R_Rate.TextColor3 = Color3.fromRGB(255,80,80)
+        elseif cur >= cap*0.7 then
+            R_Rate.TextColor3 = Color3.fromRGB(255,200,50)
+        else
+            R_Rate.TextColor3 = Color3.fromRGB(120,220,120)
+        end
+    end)
+end
 
 -- ============================================================
---  MAIN LOOP
+--  INIT
 -- ============================================================
 RefreshChar()
 SetupHPWatch()
@@ -798,26 +948,42 @@ if LP.Character then
     WatchOutgoing(LP.Character)
 end
 
+LP.CharacterAdded:Connect(function(c)
+    task.wait(0.12)
+    RefreshChar()
+    SetupHPWatch()
+    WatchOutgoing(c)
+    task.wait(0.4)
+    BuildUI()
+end)
+
 Decoy:schedule()
 Decoy:scheduleSeq()
 
+-- ============================================================
+--  MAIN HEARTBEAT LOOP — nil-guarded
+-- ============================================================
 RunService.Heartbeat:Connect(function()
+    -- Nil guard — prevent "attempt to index nil" on load
+    if not Parry then return end
+    if not AutoBlock then return end
+    if not CombatLock then return end
+
     MaybeRotateNames()
     RefreshChar()
     CheckNeutral()
 
-    -- v9.1 tick systems
     AutoBlock:tick()
     CombatLock:tick()
 
     local now = os.clock()
 
-    if not MC.root or not MC.hum or MC.hum.Health <= 0 then return end
+    if not MC.root or not MC.hum then return end
+    if MC.hum.Health <= 0 then return end
 
-    -- Setup HP watch kalau belum
     SetupHPWatch()
 
-    -- Parry + AutoBlock arm scan per enemy
+    -- Parry + AutoBlock arm scan
     if Parry.on then
         for _,p in ipairs(Players:GetPlayers()) do
             if p ~= LP then
@@ -829,12 +995,11 @@ RunService.Heartbeat:Connect(function()
                     local eh = ec:FindFirstChildWhichIsA("Humanoid")
                     if er and eh and eh.Health > 0 then
                         local sc, hvy = Score(p, ps)
-                        -- v9.1: arm auto block saat ancaman terdeteksi
-                        -- bahkan sebelum threshold parry
+                        -- Arm block fallback saat ancaman score >= 2
                         if sc >= 2 then
                             AutoBlock:arm(hvy)
                         end
-                        -- Threshold 3 untuk parry fire
+                        -- Parry fire threshold = 3
                         if sc >= Parry.dynThreshold then
                             FireParry(uid, hvy, ps)
                         end
@@ -848,23 +1013,25 @@ RunService.Heartbeat:Connect(function()
 end)
 
 -- ============================================================
---  TOGGLE — Q untuk parry, E untuk lock
+--  KEYBINDS
+--  Q = toggle Parry
+--  E = toggle Lock (hanya aktif saat ada combat exchange)
 -- ============================================================
 UIS.InputBegan:Connect(function(input, gpe)
     if gpe then return end
 
+    -- Q: Toggle Parry
     if input.KeyCode == Enum.KeyCode.Q then
         Parry.on = not Parry.on
-        print("[HSA v9.1] Parry:", Parry.on and "ON" or "OFF")
         if not Parry.on then
-            -- Matiin parry juga matiin auto block
             AutoBlock:disarm()
         end
+        print("[HSA v9.1] Parry:", Parry.on and "ON" or "OFF")
     end
 
+    -- E: Toggle Lock
     if input.KeyCode == Enum.KeyCode.E then
         if Lock.on then
-            -- Manual reset ke neutral
             Lock.on       = false
             Lock.target   = nil
             Lock.inCombat = false
@@ -877,17 +1044,22 @@ UIS.InputBegan:Connect(function(input, gpe)
                 pcall(function() Lock.att0:Destroy() end)
                 Lock.att0 = nil
             end
-            print("[HSA v9.1] Lock: NEUTRAL (manual)")
+            print("[HSA v9.1] Lock: NEUTRAL")
         else
-            -- Hanya bisa lock kalau ada combat exchange
             if CombatLock.active then
                 Lock.on = true
                 print("[HSA v9.1] Lock: ACTIVE")
             else
-                print("[HSA v9.1] Lock: waiting for hit exchange first")
+                print("[HSA v9.1] Lock: no active exchange — go hit someone first")
             end
         end
     end
 end)
 
-print("[HSA v9.1 SPECTER] Loaded — Q:Parry / E:Lock")
+-- Build UI
+task.spawn(function()
+    task.wait(0.6)
+    BuildUI()
+end)
+
+print("[HSA v9.1 SPECTER] Loaded — Q:Parry | E:Lock")
