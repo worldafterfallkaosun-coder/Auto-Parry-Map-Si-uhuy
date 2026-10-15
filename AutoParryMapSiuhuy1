@@ -9,6 +9,8 @@
 --    threshold adaptif, combo tracking, heavy alert dari FX,
 --    release selalu kekirim (ga nyangkut)
 --  · Lock: NETRAL kalau ga ngehit / ga dihit (swing doang = grace singkat)
+--  · PRECISE PARRY: 1 press per swing, timing dipelajari dari hit/parry
+--    (HitOff/GoodOff per anim), press ga lewat rate cap. Log di console (PCFG.debug)
 --  · UI + Smart Lock player = v9.0
 --
 --  KEYS: RightShift = Parry | RightControl = Lock
@@ -344,16 +346,26 @@ local LOCK_SWITCH_HYSTERESIS = 22
 --  PARRY CONFIG — semua knob parry di satu tempat
 -- ============================================================
 local PCFG = {
+    -- jalur cadangan (spam by skor)
     pingLeadScale = 0.6,    -- kompensasi ping ke reaction delay (0 = mati)
-    floorLight    = 0.045,  -- delay minimum light (human floor)
-    floorHeavy    = 0.035,  -- delay minimum heavy
+    floorLight    = 0.045,
+    floorHeavy    = 0.035,
     urgentLo      = 0.050,  -- recovery parry: 50–80ms
     urgentHi      = 0.080,
-    recoverGate   = 0.10,   -- jeda minimum antar recovery parry
-    topN          = 2,      -- max musuh yang di-parry per frame (prioritas skor)
-    reserveFrac   = 0.5,    -- musuh tanpa sinyal serangan cuma boleh makan 50% rate cap
+    recoverGate   = 0.10,
+    topN          = 2,
+    reserveFrac   = 0.5,
+    spamScore     = 45,     -- tanpa anim serangan kebaca: cuma nembak kalau ada attr serangan / skor >= ini
+    -- jalur presisi (1 press per swing, timing dipelajari)
+    pressLead     = 0.07,   -- press mendarat segini detik SEBELUM hit
+    defaultLo     = 0.07,   -- sebelum ada data: delay lognormal sempit 70–150ms
+    defaultHi     = 0.15,
+    jitter        = 0.010,  -- ±10ms biar ga mekanis
+    learnAlpha    = 0.5,
+    debug         = true,   -- print log timing + nama anim ke console (F9)
 }
 Parry.attempts, Parry.lastFireAt, Parry.lastFireUid = 0, 0, 0
+Parry.lastPressName, Parry.lastPressOff, Parry.lastEpisodeT = nil, 0, 0
 
 -- ============================================================
 --  HELPERS
@@ -469,25 +481,37 @@ local ATK_KW = {
     "kick","hitrun","fire","slam","smash","launch","charge","burst",
 }
 
+local function IsAtkName(n)
+    if IsM2Anim(n) then return true end
+    local l = n:lower()
+    for _,k in ipairs(ATK_KW) do
+        if l:find(k,1,true) then return true end
+    end
+    return false
+end
+
+-- track serangan yang lagi main (+ nama), nil kalau ga ada
+local function AttackTrack(eh)
+    local anim = eh and eh:FindFirstChildOfClass("Animator")
+    if not anim then return nil end
+    local ok,tracks = pcall(function() return anim:GetPlayingAnimationTracks() end)
+    if not ok or not tracks then return nil end
+    for _,t in pairs(tracks) do
+        if t and t.IsPlaying and t.Animation and IsAtkName(t.Animation.Name) then
+            return t, t.Animation.Name
+        end
+    end
+    return nil
+end
+
+-- return: striking?, track, nama anim
 local function EnemyStriking(ec, eh)
     for _,a in ipairs(STRIKE_ATTRS) do
         if ec:GetAttribute(a)==true then return true end
         if eh and eh:GetAttribute(a)==true then return true end
     end
-    local anim = eh and eh:FindFirstChildOfClass("Animator")
-    if anim then
-        local ok,tracks = pcall(function() return anim:GetPlayingAnimationTracks() end)
-        if ok and tracks then
-            for _,t in pairs(tracks) do
-                if t and t.IsPlaying and t.Animation then
-                    local n = t.Animation.Name:lower()
-                    for _,k in ipairs(ATK_KW) do
-                        if n:find(k,1,true) then return true end
-                    end
-                end
-            end
-        end
-    end
+    local t,n = AttackTrack(eh)
+    if t then return true, t, n end
     return false
 end
 
@@ -622,6 +646,7 @@ end
 
 function Decoy:tick()
     local now=os.clock()
+    if now - Parry.lastEpisodeT < 1.5 then return end   -- jangan ganggu window serangan
     if now>=self.nextT and RL:ok() then
         pcall(function()
             task.delay(LogN(-2.80, 0.15, 0.040, 0.140), function()
@@ -732,6 +757,73 @@ local function ReactiveParry(isHeavy)
     if now - lastReactT < PCFG.recoverGate then return end
     lastReactT = now
     FireParry(0, isHeavy, FXPS, true)
+end
+
+-- ============================================================
+--  PRECISE PARRY — 1 press per swing, timing dipelajari
+--  HitOff[anim]  = kapan hit mendarat (detik sejak anim start), dipelajari pas kena hit
+--  GoodOff[anim] = kapan press kita sukses (ParryFX), dipelajari pas parry berhasil
+--  prioritas: GoodOff > HitOff - pressLead - ping > default sempit
+--  press ga lewat rate cap (cuma 1 per swing) → ga kelaparan lagi
+-- ============================================================
+local HitOff, GoodOff, SeenAnim = {}, {}, {}
+
+local function dbg(...)
+    if PCFG.debug then print("[HSA]", ...) end
+end
+
+local function Learn(tbl, key, v)
+    local old = tbl[key]
+    tbl[key] = old and (old*(1-PCFG.learnAlpha) + v*PCFG.learnAlpha) or v
+end
+
+local function SchedulePress(name, startT)
+    local now   = os.clock()
+    local pingS = Ping:get() / 1000
+    local age   = now - startT
+    local tgt, src
+    if GoodOff[name] then
+        tgt, src = GoodOff[name], "good"
+    elseif HitOff[name] then
+        tgt, src = HitOff[name] - PCFG.pressLead - pingS, "hit"
+    else
+        local react = LogN(-2.25, 0.18, PCFG.defaultLo, PCFG.defaultHi)
+        tgt, src = age + math.max(PCFG.floorLight, react - pingS*PCFG.pingLeadScale), "default"
+    end
+    tgt = tgt + (math.random() - 0.5) * 2 * PCFG.jitter
+    local delay = math.max(0.012, startT + tgt - now)
+    local hold  = PCFG.pressLead + LogN(-2.75, 0.15, 0.05, 0.10)
+    dbg(string.format("swing %s age=%.3f src=%s press@+%.3f (delay %.3f) ping=%dms",
+        name, age, src, tgt, delay, math.floor(pingS*1000)))
+
+    task.delay(delay, function()
+        if not Parry.on then return end
+        pcall(function() RequestBlock:FireServer(true) end)
+        RL:mark()
+        Parry.attempts   = Parry.attempts + 1
+        Parry.parryCount = Parry.parryCount + 1
+        Parry.lastFireAt = os.clock()
+        Parry.lastPressName, Parry.lastPressOff = name, os.clock() - startT
+        task.delay(hold, function()
+            pcall(function() RequestBlock:FireServer(false) end)
+            RL:mark()
+        end)
+    end)
+end
+
+-- debug: nama semua anim musuh dekat (sekali per nama) buat nambah keyword
+local function DebugAnims(eh)
+    local anim = eh:FindFirstChildOfClass("Animator")
+    if not anim then return end
+    local ok,tracks = pcall(function() return anim:GetPlayingAnimationTracks() end)
+    if not ok or not tracks then return end
+    for _,t in pairs(tracks) do
+        local n = t.Animation and t.Animation.Name
+        if n and not SeenAnim[n] then
+            SeenAnim[n] = true
+            print(string.format("[HSA] anim seen: %s len=%.2f atk=%s", n, t.Length, tostring(IsAtkName(n))))
+        end
+    end
 end
 
 -- ============================================================
@@ -909,6 +1001,28 @@ local function OnHitTaken(src)
     local near = NearestEnemy(24)
     if not near then return end                           -- fall dmg / DoT: bukan exchange
     lastHitTakenT = now
+    -- belajar: hit mendarat berapa detik setelah anim penyerang mulai
+    do
+        local bestPS, bd = nil, 9999
+        for _,p in ipairs(Players:GetPlayers()) do
+            local ps = PS[p.UserId]
+            if p ~= LP and ps and ps.atkName and not ps.atkHitSeen
+               and (now - ps.atkStartT) > 0.04 and (now - ps.atkStartT) < 1.3 then
+                local r = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+                local d = (r and MC.root) and Dist(MC.root, r) or 9999
+                if d < bd then bd = d; bestPS = ps end
+            end
+        end
+        if bestPS then
+            bestPS.atkHitSeen = true
+            local off = now - bestPS.atkStartT
+            Learn(HitOff, bestPS.atkName, off)
+            local missed = bestPS.atkPressed
+            if missed then GoodOff[bestPS.atkName] = nil end   -- press kita meleset, buang
+            dbg(string.format("HIT by %s at +%.3f (learned %.3f) pressed=%s",
+                bestPS.atkName, off, HitOff[bestPS.atkName], tostring(missed)))
+        end
+    end
     MarkCombat(LockCFG.ExchangeTTL)
     if Parry.on then Parry.missCount = Parry.missCount + 1 end
     UpdateCombo(GetPS(near.UserId), false, "hit")
@@ -1069,6 +1183,11 @@ end
 if ParryFX then
     ParryFX.OnClientEvent:Connect(function()
         if os.clock() - Parry.lastFireAt > 0.6 then return end    -- bukan parry kita
+        if Parry.lastPressName then
+            Learn(GoodOff, Parry.lastPressName, Parry.lastPressOff)
+            dbg(string.format("PARRY ok %s press@+%.3f (learned %.3f)",
+                Parry.lastPressName, Parry.lastPressOff, GoodOff[Parry.lastPressName]))
+        end
         MarkCombat(LockCFG.ExchangeTTL)
         UpdateThreshold(false, PS[Parry.lastFireUid])
     end)
@@ -1373,6 +1492,7 @@ RunService.Heartbeat:Connect(function()
     if MC.hum.Health <= 0 then return end
 
     if Parry.on then
+        local now = os.clock()
         local q = {}
         for _,p in ipairs(Players:GetPlayers()) do
             if p ~= LP then
@@ -1382,9 +1502,29 @@ RunService.Heartbeat:Connect(function()
                 if er and eh and eh.Health > 0 then
                     local ps = GetPS(p.UserId)
                     local sc, hvy = Score(p, ps)
-                    if sc >= Parry.dynThreshold then
-                        local atk = Dist(MC.root, er) <= 16 and EnemyStriking(ec, eh)
-                        q[#q+1] = { uid=p.UserId, sc=sc, hvy=hvy, ps=ps, atk=atk }
+                    if sc > 0 then                       -- 0 = jauh / dari belakang / mati
+                        local dist = Dist(MC.root, er)
+                        local atk, tr, nm = false, nil, nil
+                        if dist <= 16 then atk, tr, nm = EnemyStriking(ec, eh) end
+                        if PCFG.debug and dist <= 14 then DebugAnims(eh) end
+
+                        if tr then
+                            -- JALUR PRESISI: 1 press per swing
+                            local startT = now - tr.TimePosition / math.max(tr.Speed, 0.05)
+                            if ps.atkTrack ~= tr or math.abs(startT - (ps.atkStartT or 0)) > 0.15 then
+                                ps.atkTrack, ps.atkStartT, ps.atkName = tr, startT, nm
+                                ps.atkPressed, ps.atkHitSeen = false, false
+                                Parry.lastEpisodeT = now
+                                UpdateCombo(ps, IsM2Anim(nm), "anim")
+                            end
+                            if not ps.atkPressed then
+                                ps.atkPressed = true
+                                SchedulePress(nm, ps.atkStartT)
+                            end
+                        elseif sc >= Parry.dynThreshold and (atk or sc >= PCFG.spamScore) then
+                            -- JALUR CADANGAN: serangan tanpa anim yang kebaca
+                            q[#q+1] = { uid=p.UserId, sc=sc, hvy=hvy, ps=ps, atk=atk }
+                        end
                     end
                 end
             end
@@ -1398,7 +1538,6 @@ RunService.Heartbeat:Connect(function()
         local cap = DynRL:cap()
         for i = 1, math.min(#q, PCFG.topN) do
             local c = q[i]
-            -- budget: proximity-only ga boleh ngabisin rate cap yang dibutuhin serangan beneran
             if c.atk or RL:count() < cap * PCFG.reserveFrac then
                 if FireParry(c.uid, c.hvy, c.ps) and c.atk then
                     UpdateCombo(c.ps, c.hvy, "HB")
