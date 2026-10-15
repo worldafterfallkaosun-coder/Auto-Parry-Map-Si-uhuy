@@ -2,21 +2,17 @@
 --  HIGH SCHOOL ANIME — Combat Tools v9.1 SPECTER
 --  by spraxy / VANTA  (rebuilt + upgraded by Nono)
 --
---  v9 ANTI-DETECT CORE (unchanged, parry logic = yang udah bagus):
---  · Human reaction delay gate: 80–220ms before first fire
---  · Single priority path: anim > attr > HB
---  · Per-enemy 95ms reaction gate
---  · Remote name rotates every 75–110s
---  · Decoy fires full human-timed press→release sequences
---
 --  v9.1:
---  · HOLD BLOCK rewrite — parry tap dulu, kalau serangan masih jalan
---    (atau kena hit = parry miss) → hold block sampai serangan selesai
---  · Parry + decoy pause selama hold aktif (ga saling release)
---  · UI + Smart Lock player = persis v9.0
---  · Nil guard Heartbeat
+--  · Hold/press block DIHAPUS — fokus parry
+--  · Parry: prioritas musuh by sinyal serangan + skor (top-N per frame),
+--    ping lead, recovery parry 50–80ms abis dihit / FX event,
+--    threshold adaptif, combo tracking, heavy alert dari FX,
+--    release selalu kekirim (ga nyangkut)
+--  · Lock: NETRAL kalau ga ngehit / ga dihit (swing doang = grace singkat)
+--  · UI + Smart Lock player = v9.0
 --
 --  KEYS: RightShift = Parry | RightControl = Lock
+--  Knob: PCFG (parry) dan LockCFG.SwingGrace / ExchangeTTL (lock)
 -- ============================================================
 
 local Players      = game:GetService("Players")
@@ -327,6 +323,8 @@ local Parry = {
 local LockCFG = {
     Range=25, LeashRange=32, LockDuration=70, SwitchCooldown=0.7,
     PredictFactor=0.13, Responsiveness=42, MaxTorque=1e6, ProxRange=13,
+    SwingGrace=1.0,   -- baru swing (belum ngehit) = lock nahan segini detik, abis itu NETRAL (0 = strict)
+    ExchangeTTL=3.0,  -- abis ngehit / dihit = lock nahan segini detik, lewat itu NETRAL
 }
 
 -- ============================================================
@@ -337,137 +335,25 @@ local Lock = {
     alignOri=nil, att0=nil,
     prevPos=nil, vel=Vector3.zero, lastVelT=0,
     lastSwitch=0, lastProx=0, isAtk=false, candidates={},
+    lastStrikeT=0, combatUntil=0,
 }
 
 local LOCK_SWITCH_HYSTERESIS = 22
 
 -- ============================================================
---  AUTO BLOCK / HOLD — v9.1 rewrite
---  Flow: parry tap (FireParry) → kalau serangan musuh masih jalan
---  setelah holdAfter, atau kita kena hit → press block & HOLD
---  sampai sinyal serangan hilang (grace) atau maxHold.
---  Selama pending/active: FireParry + Decoy diem.
+--  PARRY CONFIG — semua knob parry di satu tempat
 -- ============================================================
-local STRIKE_SELF = { "IsPunching","IsHeavyPunching","IsHitRunning","IsKickCombo","IsFiring" }
-
--- sengaja tanpa IsActionLocked / IsStartingBattle: itu bisa nyala pas kita sendiri lagi block/stun
-local function IsSelfStriking()
-    local c,h = MC.char, MC.hum
-    if not c then return false end
-    for _,a in ipairs(STRIKE_SELF) do
-        if c:GetAttribute(a)==true then return true end
-        if h and h:GetAttribute(a)==true then return true end
-    end
-    return false
-end
-
-local AutoBlock = {
-    active=false, pending=false, token=0,
-    pressT=0, cooldown=0,
-    lastAtkT=-10, lastHitT=-10, episodeT=0, holdAfter=0.28, heavy=false,
-    grace=0.25, minHold=0.18, maxHold=1.0,
-    parryBusyUntil=0,
+local PCFG = {
+    pingLeadScale = 0.6,    -- kompensasi ping ke reaction delay (0 = mati)
+    floorLight    = 0.045,  -- delay minimum light (human floor)
+    floorHeavy    = 0.035,  -- delay minimum heavy
+    urgentLo      = 0.050,  -- recovery parry: 50–80ms
+    urgentHi      = 0.080,
+    recoverGate   = 0.10,   -- jeda minimum antar recovery parry
+    topN          = 2,      -- max musuh yang di-parry per frame (prioritas skor)
+    reserveFrac   = 0.5,    -- musuh tanpa sinyal serangan cuma boleh makan 50% rate cap
 }
-
-local function BlockSend(v)
-    pcall(function() RequestBlock:FireServer(v) end)
-    RL:mark()
-end
-
--- dipanggil tiap frame selama ada musuh nyerang
-function AutoBlock:threat(isHeavy)
-    local now = os.clock()
-    if now - self.lastAtkT > 0.40 then          -- episode serangan baru
-        self.episodeT  = now
-        self.holdAfter = isHeavy and LogN(-2.15, 0.25, 0.07, 0.20)
-                                  or LogN(-1.35, 0.25, 0.18, 0.42)
-        self.heavy = false
-    end
-    self.lastAtkT = now
-    if isHeavy then self.heavy = true end
-end
-
--- HP turun + ada musuh <=16 stud = parry miss → hold langsung
-function AutoBlock:onHit()
-    local root = MC.root; if not root then return end
-    for _,p in ipairs(Players:GetPlayers()) do
-        if p ~= LP and p.Character then
-            local er = p.Character:FindFirstChild("HumanoidRootPart")
-            local eh = p.Character:FindFirstChildWhichIsA("Humanoid")
-            if er and eh and eh.Health > 0
-               and (er.Position - root.Position).Magnitude <= 16 then
-                self.lastHitT = os.clock()
-                return
-            end
-        end
-    end
-end
-
-function AutoBlock:release()
-    if self.active then BlockSend(false) end
-    self.active   = false
-    self.cooldown = os.clock() + LogN(-1.55, 0.20, 0.14, 0.32)
-    self.heavy    = false
-end
-
-function AutoBlock:reset()
-    self.token = self.token + 1
-    if self.active then BlockSend(false) end
-    self.active, self.pending = false, false
-    self.lastAtkT, self.lastHitT = -10, -10
-end
-
-function AutoBlock:press(urgent)
-    if not RL:ok() then self.cooldown = os.clock() + 0.05; return end
-    self.pending = true
-    self.token   = self.token + 1
-    local tok    = self.token
-    local react  = ReactionDelay(self.heavy) * (urgent and 0.35 or 0.5)
-    -- tunggu parry yang lagi jalan kelar dulu (biar release-nya ga ngelepas hold)
-    local wait_ = math.max(react, self.parryBusyUntil - os.clock())
-    task.delay(wait_, function()
-        if tok ~= self.token then return end
-        self.pending = false
-        local alive = MC.hum and MC.hum.Health > 0
-        if not Parry.on or not alive or IsSelfStriking() then
-            BlockSend(false)    -- parry tap yang kena skip bisa masih nahan, lepas
-            return
-        end
-        BlockSend(true)
-        self.active  = true
-        self.pressT  = os.clock()
-        self.grace   = LogN(-1.45, 0.20, 0.16, 0.36)
-        self.minHold = LogN(-1.75, 0.20, 0.12, 0.30)
-        self.maxHold = LogN( 0.10, 0.22, 0.75, 1.60)
-    end)
-end
-
-function AutoBlock:tick()
-    local now = os.clock()
-    if not Parry.on then
-        if self.active then self:release() end
-        return
-    end
-    local alive = MC.hum and MC.hum.Health > 0
-
-    if self.active then
-        local held = now - self.pressT
-        local last = math.max(self.lastAtkT, self.lastHitT)
-        if held >= self.maxHold
-        or (held >= self.minHold and now - last > self.grace)
-        or not alive or IsSelfStriking() then
-            self:release()
-        end
-        return
-    end
-
-    if self.pending or now < self.cooldown then return end
-    if not alive or IsSelfStriking() then return end
-
-    local byHit = (now - self.lastHitT) < 0.15
-    local byAtk = (now - self.lastAtkT) < 0.10 and (now - self.episodeT) >= self.holdAfter
-    if byHit or byAtk then self:press(byHit) end
-end
+Parry.attempts, Parry.lastFireAt, Parry.lastFireUid = 0, 0, 0
 
 -- ============================================================
 --  HELPERS
@@ -528,18 +414,54 @@ end
 -- ============================================================
 --  COMBAT MARK
 -- ============================================================
-local function MarkCombat()
-    Lock.combatTime=os.clock(); Lock.inCombat=true
+local function NearestEnemy(range)
+    local root = MC.root
+    if not root then return nil, 9999 end
+    local best, bd = nil, range or 9999
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and p.Character then
+            local er = p.Character:FindFirstChild("HumanoidRootPart")
+            local eh = p.Character:FindFirstChildWhichIsA("Humanoid")
+            if er and eh and eh.Health > 0 then
+                local d = (er.Position - root.Position).Magnitude
+                if d < bd then bd = d; best = p end
+            end
+        end
+    end
+    return best, bd
+end
+
+local function NearEnemy(range) return (NearestEnemy(range)) ~= nil end
+
+-- swing beneran (tanpa IsActionLocked / IsStartingBattle)
+local STRIKE_SELF = { "IsPunching","IsHeavyPunching","IsHitRunning","IsKickCombo","IsFiring" }
+local function IsSelfStriking()
+    local c,h = MC.char, MC.hum
+    if not c then return false end
+    for _,a in ipairs(STRIKE_SELF) do
+        if c:GetAttribute(a)==true then return true end
+        if h and h:GetAttribute(a)==true then return true end
+    end
+    return false
+end
+
+-- lock cuma nahan selama ada "exchange": ttl = berapa lama sejak event terakhir
+local function MarkCombat(ttl)
+    local now = os.clock()
+    Lock.combatUntil = math.max(Lock.combatUntil or 0, now + (ttl or LockCFG.ExchangeTTL))
+    Lock.combatTime  = now
+    Lock.inCombat    = true
 end
 
 local function CheckNeutral()
-    if not Lock.inCombat then return end
-    if os.clock()-Lock.combatTime > 4.0 then Lock.inCombat=false end
+    if Lock.inCombat and os.clock() > (Lock.combatUntil or 0) then
+        Lock.inCombat = false      -- ga ngehit / ga dihit → NETRAL
+    end
 end
 
 -- ============================================================
---  ENEMY STRIKING — sinyal serangan ketat buat hold block
---  (FightMode / InCombat sengaja ga dihitung, itu bukan swing)
+--  ENEMY STRIKING — sinyal serangan ketat (prioritas parry)
+--  FightMode / InCombat sengaja ga dihitung, itu bukan swing
 -- ============================================================
 local STRIKE_ATTRS = { "IsPunching","IsHeavyPunching","IsHitRunning","IsKickCombo","IsFiring" }
 local ATK_KW = {
@@ -700,11 +622,10 @@ end
 
 function Decoy:tick()
     local now=os.clock()
-    if AutoBlock.active or AutoBlock.pending then return end
     if now>=self.nextT and RL:ok() then
         pcall(function()
             task.delay(LogN(-2.80, 0.15, 0.040, 0.140), function()
-                if RL:ok() and not (AutoBlock.active or AutoBlock.pending) then RequestBlock:FireServer(false); RL:mark() end
+                if RL:ok() then RequestBlock:FireServer(false); RL:mark() end
             end)
         end)
         self:schedule()
@@ -714,11 +635,11 @@ function Decoy:tick()
             task.spawn(function()
                 local react = ReactionDelay(false)
                 task.wait(react)
-                if not RL:ok() or AutoBlock.active or AutoBlock.pending then return end
+                if not RL:ok() then return end
                 RequestBlock:FireServer(true); RL:mark()
                 local tap = LogN(-2.90, 0.18, 0.055, 0.160)
                 task.wait(tap)
-                if RL:ok() and not (AutoBlock.active or AutoBlock.pending) then RequestBlock:FireServer(false); RL:mark() end
+                if RL:ok() then RequestBlock:FireServer(false); RL:mark() end
             end)
         end)
         self:scheduleSeq()
@@ -726,56 +647,91 @@ function Decoy:tick()
 end
 
 -- ============================================================
---  PARRY FIRE — identik dgn v9.1 original (cuma disarm() dibuang)
+--  COMBO / THRESHOLD (dari v9.0 — sebelumnya mati di 9.1)
+--  Miss turunin threshold (lebih sensitif), sukses naikin pelan.
+--  Miss SENGAJA ga nge-penalti skor per-musuh (itu kebalikan dari tujuan).
 -- ============================================================
-local function FireParry(uid, isHeavy, ps)
+local function RecordHit(ps, isHeavy, src)
     local now = os.clock()
-    if now - ps.lastFireT < 0.095 then return end
-    ps.lastFireT = now
-    if not RL:ok() then return end
+    table.insert(ps.history, {t=now, h=isHeavy, s=src})
+    if #ps.history > 28 then table.remove(ps.history, 1) end
+    ps.lastHitTime = now
+    if #ps.history >= 3 then
+        local sum, n = 0, 0
+        for i = 2, #ps.history do
+            sum = sum + ps.history[i].t - ps.history[i-1].t; n = n + 1
+        end
+        ps.avgInterval = sum / n
+    else ps.avgInterval = nil end
+end
 
-    local delay = ReactionDelay(isHeavy)
+local function UpdateCombo(ps, isHeavy, src)
+    if os.clock() - ps.lastHitTime > 1.5 then ps.combo = 0 end
+    RecordHit(ps, isHeavy, src)
+    ps.combo = ps.combo + 1
+end
+
+local function UpdateThreshold(missed, ps)
+    local target = missed and 3 or 8
+    Parry.dynThreshold = math.clamp(Parry.dynThreshold*0.82 + target*0.18, 3, 10)
+    if missed then
+        Parry.consecMiss = Parry.consecMiss + 1
+        if Parry.consecMiss >= 4 then Parry.consecMiss = 0; Parry.nextFire = 0 end
+    else
+        Parry.consecMiss = 0
+        if ps then ps.missStreak = 0 end
+    end
+end
+
+-- ============================================================
+--  PARRY FIRE
+--  normal : reaction delay lognormal 80–220ms, dikurangi ping lead
+--  urgent : 50–80ms (recovery abis dihit / FX event)
+--  release SELALU dikirim (ga kena rate limit → block ga bisa nyangkut)
+-- ============================================================
+local FXPS = { lastFireT = 0 }
+
+local function FireParry(uid, isHeavy, ps, urgent)
+    local now = os.clock()
+    if now - ps.lastFireT < 0.095 then return false end
+    ps.lastFireT = now
+    if not RL:ok() then return false end
+    Parry.lastFireUid = uid
+
+    local delay
+    if urgent then
+        delay = LogN(-2.75, 0.10, PCFG.urgentLo, PCFG.urgentHi)
+    else
+        delay = ReactionDelay(isHeavy)
+        delay = math.max(isHeavy and PCFG.floorHeavy or PCFG.floorLight,
+                         delay - Ping:lead() * PCFG.pingLeadScale)
+    end
+
     task.delay(delay, function()
         if not RL:ok() then return end
-        pcall(function()
-            RequestBlock:FireServer(true)
-            RL:mark()
-            Parry.parryCount = Parry.parryCount + 1
-        end)
+        pcall(function() RequestBlock:FireServer(true) end)
+        RL:mark()
+        Parry.attempts   = Parry.attempts + 1
+        Parry.parryCount = Parry.parryCount + 1
+        Parry.lastFireAt = os.clock()
         local hold = isHeavy and
             LogN(-2.75, 0.18, 0.055, 0.150) or
             LogN(-2.90, 0.15, 0.040, 0.130)
         task.delay(hold, function()
-            pcall(function()
-                if RL:ok() then
-                    RequestBlock:FireServer(false)
-                    RL:mark()
-                end
-            end)
+            pcall(function() RequestBlock:FireServer(false) end)
+            RL:mark()
         end)
     end)
+    return true
 end
 
--- ============================================================
---  HP WATCH — incoming hit via HP drop
--- ============================================================
-local HPWatch = { lastHP=nil, lastHum=nil }
-
-local function SetupHPWatch()
-    local hum = MC.hum
-    if not hum or hum == HPWatch.lastHum then return end
-    HPWatch.lastHum = hum
-    HPWatch.lastHP  = hum.Health
-
-    hum:GetPropertyChangedSignal("Health"):Connect(function()
-        local cur  = hum.Health
-        local prev = HPWatch.lastHP or cur
-        if cur < prev then
-            MarkCombat()
-            if Parry.on then AutoBlock:onHit() end
-        end
-        HPWatch.lastHP = cur
-    end)
+local lastReactT = 0
+local function ReactiveParry(isHeavy)
+    if not Parry.on then return end
+    local now = os.clock()
+    if now - lastReactT < PCFG.recoverGate then return end
+    lastReactT = now
+    FireParry(0, isHeavy, FXPS, true)
 end
 
 -- ============================================================
@@ -887,7 +843,7 @@ end
 local LockOn,UnlockAll
 
 local function FullNeutralReset()
-    Lock.target=nil; Lock.inCombat=false; Lock.combatTime=0
+    Lock.target=nil; Lock.inCombat=false; Lock.combatTime=0; Lock.combatUntil=0
     Lock.prevPos=nil; Lock.vel=Vector3.zero; Lock.isAtk=false
     DestroyConstraint()
     Parry.nextFire=0; Parry.firing=false; Parry.firingAt=0
@@ -935,9 +891,59 @@ local function ProxCheck()
                 end
             end
         end
-        if closest then MarkCombat(); LockOn(closest) end
+        if closest then MarkCombat(LockCFG.SwingGrace); LockOn(closest) end
     end
     Lock.isAtk=isAtk
+end
+
+-- ============================================================
+--  EXCHANGE — lock cuma aktif kalau ada hit beneran
+--  incoming : HP kita turun / ReactionFX (dan ada musuh dekat)
+--  outgoing : HP musuh turun pas kita lagi swing & dia dekat
+--  ga ada dua-duanya > ExchangeTTL (swing doang > SwingGrace) → NETRAL
+-- ============================================================
+local lastHitTakenT = 0
+local function OnHitTaken(src)
+    local now = os.clock()
+    if now - lastHitTakenT < 0.08 then return end        -- dedup FX + HP drop
+    local near = NearestEnemy(24)
+    if not near then return end                           -- fall dmg / DoT: bukan exchange
+    lastHitTakenT = now
+    MarkCombat(LockCFG.ExchangeTTL)
+    if Parry.on then Parry.missCount = Parry.missCount + 1 end
+    UpdateCombo(GetPS(near.UserId), false, "hit")
+    UpdateThreshold(true, nil)
+    if Lock.on and now - Lock.lastSwitch >= LockCFG.SwitchCooldown then
+        Lock.lastSwitch = now
+        LockOn(near)
+    end
+    ReactiveParry(false)                                  -- sambung combo = parry next hit
+end
+
+local EnemyHP = {}
+local function HitWatch()
+    local root = MC.root; if not root then return end
+    local now = os.clock()
+    local striking = IsSelfStriking() or (now - Lock.lastStrikeT) < 0.9
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p ~= LP then
+            local c = p.Character
+            local h = c and c:FindFirstChildWhichIsA("Humanoid")
+            if h then
+                local prev = EnemyHP[p.UserId]
+                EnemyHP[p.UserId] = h.Health
+                if prev and striking and h.Health < prev - 0.01 then
+                    local r = c:FindFirstChild("HumanoidRootPart")
+                    if r and Dist(root, r) <= 20 then
+                        MarkCombat(LockCFG.ExchangeTTL)
+                        if Lock.on then LockOn(p) end
+                    end
+                end
+            else
+                EnemyHP[p.UserId] = nil
+            end
+        end
+    end
 end
 
 local function HookSelf(char)
@@ -948,7 +954,7 @@ local function HookSelf(char)
         pcall(function()
             char:GetAttributeChangedSignal(attr):Connect(function()
                 if char:GetAttribute(attr)==true then
-                    MarkCombat()
+                    MarkCombat(LockCFG.SwingGrace); Lock.lastStrikeT=os.clock()
                     if Lock.on then
                         local best=GetBestTarget(true)
                         if best then LockOn(best) end
@@ -971,29 +977,7 @@ local function HookSelf(char)
 
         local prevHP=hum.Health
         hum:GetPropertyChangedSignal("Health"):Connect(function()
-            if hum.Health<prevHP then
-                MarkCombat()
-                if Lock.on then
-                    local now=os.clock()
-                    if now-Lock.lastSwitch>=LockCFG.SwitchCooldown then
-                        Lock.lastSwitch=now
-                        local root=MC.root
-                        local closest,cd=nil,LockCFG.Range
-                        for _,p in pairs(Players:GetPlayers()) do
-                            if p~=LP and p.Character then
-                                local er=p.Character:FindFirstChild("HumanoidRootPart")
-                                local eh=p.Character:FindFirstChild("Humanoid")
-                                if er and eh and eh.Health>0 then
-                                    local d=root and Dist(root,er) or 9999
-                                    if d<cd then cd=d; closest=p end
-                                end
-                            end
-                        end
-                        if closest then LockOn(closest)
-                        else local b=GetBestTarget(true); if b then LockOn(b) end end
-                    end
-                end
-            end
+            if hum.Health<prevHP then OnHitTaken("hp") end
             prevHP=hum.Health
         end)
     end
@@ -1006,7 +990,7 @@ end)
 if LP.Character then HookSelf(LP.Character) end
 
 RunService.Heartbeat:Connect(function(dt)
-    CheckNeutral(); ProxCheck()
+    CheckNeutral(); ProxCheck(); HitWatch()
     local active=Lock.on and Lock.inCombat
     if not active then
         if Lock.target and not Lock.inCombat then UnlockAll() end
@@ -1027,8 +1011,68 @@ RunService.Heartbeat:Connect(function(dt)
 end)
 
 Players.PlayerRemoving:Connect(function(p)
+    EnemyHP[p.UserId]=nil
     if Lock.target==p then UnlockAll() end
 end)
+
+-- ============================================================
+--  FX HOOKS — warning dini + recovery (cuma jalan kalau Parry ON)
+-- ============================================================
+local function AttackerNear(attacker)
+    if attacker and attacker ~= LP then
+        local r = attacker.Character and attacker.Character:FindFirstChild("HumanoidRootPart")
+        return (r and MC.root and Dist(MC.root, r) <= 24) and true or false
+    end
+    return NearEnemy(24)
+end
+
+if ReactionFX then
+    ReactionFX.OnClientEvent:Connect(function() OnHitTaken("fx") end)
+end
+
+if HeavyPunchFX then
+    HeavyPunchFX.OnClientEvent:Connect(function(attacker)
+        if not AttackerNear(attacker) then return end
+        if attacker and attacker ~= LP then
+            local ps = GetPS(attacker.UserId)
+            ps.heavyAlert = true; ps.heavyAlertExp = os.clock() + 3.5
+        end
+        ReactiveParry(true)
+    end)
+end
+
+if KickComboFX then
+    KickComboFX.OnClientEvent:Connect(function()
+        if NearEnemy(20) then ReactiveParry(true) end
+    end)
+end
+
+if HitRunFX then
+    HitRunFX.OnClientEvent:Connect(function()
+        if NearEnemy(20) then ReactiveParry(false) end
+    end)
+end
+
+if CounterHitFX then
+    CounterHitFX.OnClientEvent:Connect(function()
+        if NearEnemy(20) then ReactiveParry(false) end
+    end)
+end
+
+if GuardBreakFX then
+    GuardBreakFX.OnClientEvent:Connect(function()
+        Parry.nextFire = 0; Parry.firing = false
+        for _,ps in pairs(PS) do ps.lastFireT = 0 end
+    end)
+end
+
+if ParryFX then
+    ParryFX.OnClientEvent:Connect(function()
+        if os.clock() - Parry.lastFireAt > 0.6 then return end    -- bukan parry kita
+        MarkCombat(LockCFG.ExchangeTTL)
+        UpdateThreshold(false, PS[Parry.lastFireUid])
+    end)
+end
 
 for _,n in ipairs({"HSA_UI","HSA_UI_v9"}) do
     local o=PGui:FindFirstChild(n); if o then o:Destroy() end
@@ -1200,7 +1244,6 @@ local function UpdateUI()
     StatLine.Text=string.format("fps:%d p:%dms | P:%d M:%d cap:%d",
         FPS.current,math.floor(Ping:get()),
         Parry.parryCount,Parry.missCount,DynRL:cap())
-    StatLine.TextColor3=AutoBlock.active and Color3.fromRGB(80,180,255) or Color3.fromRGB(60,60,60)  -- biru = lagi HOLD block
     local pct=math.clamp(RL:count()/math.max(DynRL:cap(),1),0,1)
     BarFill.Size=UDim2.new(pct,0,1,0)
     BarFill.BackgroundColor3=pct>0.75 and Color3.fromRGB(210,50,50)
@@ -1307,56 +1350,58 @@ UpdateUI()
 --  INIT
 -- ============================================================
 RefreshChar()
-SetupHPWatch()
 Decoy:schedule()
 Decoy:scheduleSeq()
 
 LP.CharacterAdded:Connect(function()
     task.wait(0.25)
     RefreshChar()
-    SetupHPWatch()
-    AutoBlock:reset()
     for uid in pairs(PS) do PS[uid]=nil end
     Decoy:schedule(); Decoy:scheduleSeq()
 end)
 
 -- ============================================================
---  MAIN HEARTBEAT — nil-guarded
+--  MAIN HEARTBEAT — priority queue parry
 -- ============================================================
 RunService.Heartbeat:Connect(function()
-    if not Parry or not AutoBlock then return end
+    if not Parry then return end
 
     MaybeRotateNames()
     RefreshChar()
-    AutoBlock:tick()
 
     if not MC.root or not MC.hum then return end
     if MC.hum.Health <= 0 then return end
 
-    SetupHPWatch()
-
     if Parry.on then
+        local q = {}
         for _,p in ipairs(Players:GetPlayers()) do
             if p ~= LP then
                 local ec = p.Character
-                if ec then
-                    local er = ec:FindFirstChild("HumanoidRootPart")
-                    local eh = ec:FindFirstChildWhichIsA("Humanoid")
-                    if er and eh and eh.Health > 0 then
-                        local ps = GetPS(p.UserId)
-                        local sc, hvy = Score(p, ps)
-                        if sc > 0 and Dist(MC.root, er) <= 16 and EnemyStriking(ec, eh) then
-                            AutoBlock:threat(hvy)
-                        end
-                        if sc >= Parry.dynThreshold
-                           and not (AutoBlock.active or AutoBlock.pending) then
-                            local before = ps.lastFireT
-                            FireParry(p.UserId, hvy, ps)
-                            if ps.lastFireT ~= before then
-                                AutoBlock.parryBusyUntil = os.clock() + (hvy and 0.26 or 0.35)
-                            end
-                        end
+                local er = ec and ec:FindFirstChild("HumanoidRootPart")
+                local eh = ec and ec:FindFirstChildWhichIsA("Humanoid")
+                if er and eh and eh.Health > 0 then
+                    local ps = GetPS(p.UserId)
+                    local sc, hvy = Score(p, ps)
+                    if sc >= Parry.dynThreshold then
+                        local atk = Dist(MC.root, er) <= 16 and EnemyStriking(ec, eh)
+                        q[#q+1] = { uid=p.UserId, sc=sc, hvy=hvy, ps=ps, atk=atk }
                     end
+                end
+            end
+        end
+
+        table.sort(q, function(a, b)
+            if a.atk ~= b.atk then return a.atk end
+            return a.sc > b.sc
+        end)
+
+        local cap = DynRL:cap()
+        for i = 1, math.min(#q, PCFG.topN) do
+            local c = q[i]
+            -- budget: proximity-only ga boleh ngabisin rate cap yang dibutuhin serangan beneran
+            if c.atk or RL:count() < cap * PCFG.reserveFrac then
+                if FireParry(c.uid, c.hvy, c.ps) and c.atk then
+                    UpdateCombo(c.ps, c.hvy, "HB")
                 end
             end
         end
