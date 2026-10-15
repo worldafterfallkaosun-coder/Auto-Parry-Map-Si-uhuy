@@ -366,6 +366,7 @@ local AutoBlock = {
     pressT=0, cooldown=0,
     lastAtkT=-10, lastHitT=-10, episodeT=0, holdAfter=0.28, heavy=false,
     grace=0.25, minHold=0.18, maxHold=1.0,
+    parryBusyUntil=0,
 }
 
 local function BlockSend(v)
@@ -422,7 +423,9 @@ function AutoBlock:press(urgent)
     self.token   = self.token + 1
     local tok    = self.token
     local react  = ReactionDelay(self.heavy) * (urgent and 0.35 or 0.5)
-    task.delay(react, function()
+    -- tunggu parry yang lagi jalan kelar dulu (biar release-nya ga ngelepas hold)
+    local wait_ = math.max(react, self.parryBusyUntil - os.clock())
+    task.delay(wait_, function()
         if tok ~= self.token then return end
         self.pending = false
         local alive = MC.hum and MC.hum.Health > 0
@@ -602,7 +605,7 @@ end
 
 local function Score(p,ps)
     local now=os.clock()
-    if now-ps.cacheTime<SCORE_TTL then return ps.cachedScore,ps.cachedHeavy,ps.cachedAtk end
+    if now-ps.cacheTime<SCORE_TTL then return ps.cachedScore,ps.cachedHeavy end
     local ec=p.Character; local root=MC.root
     if not ec or not root then ps.cachedScore=0; return 0,false end
     local er=ec:FindFirstChild("HumanoidRootPart")
@@ -665,11 +668,9 @@ local function Score(p,ps)
 
     if ps.missStreak >= 3 then sc=sc-math.min(ps.missStreak*8,40) end
 
-    local atk = (d<=16) and EnemyStriking(ec,eh) or false
-
     local final=math.min(sc,300)
-    ps.cachedScore=final; ps.cachedHeavy=hvy; ps.cachedAtk=atk; ps.cacheTime=now
-    return final,hvy,atk
+    ps.cachedScore=final; ps.cachedHeavy=hvy; ps.cacheTime=now
+    return final,hvy
 end
 
 -- ============================================================
@@ -725,11 +726,9 @@ function Decoy:tick()
 end
 
 -- ============================================================
---  PARRY FIRE — logic sama, tapi pause pas hold block aktif
---  (release selalu dikirim, ga kena rate limit → ga bisa nyangkut)
+--  PARRY FIRE — identik dgn v9.1 original (cuma disarm() dibuang)
 -- ============================================================
 local function FireParry(uid, isHeavy, ps)
-    if AutoBlock.active or AutoBlock.pending then return end
     local now = os.clock()
     if now - ps.lastFireT < 0.095 then return end
     ps.lastFireT = now
@@ -737,7 +736,6 @@ local function FireParry(uid, isHeavy, ps)
 
     local delay = ReactionDelay(isHeavy)
     task.delay(delay, function()
-        if AutoBlock.active or AutoBlock.pending then return end
         if not RL:ok() then return end
         pcall(function()
             RequestBlock:FireServer(true)
@@ -748,9 +746,12 @@ local function FireParry(uid, isHeavy, ps)
             LogN(-2.75, 0.18, 0.055, 0.150) or
             LogN(-2.90, 0.15, 0.040, 0.130)
         task.delay(hold, function()
-            if AutoBlock.active or AutoBlock.pending then return end  -- hold yang ngelepas nanti
-            pcall(function() RequestBlock:FireServer(false) end)
-            RL:mark()
+            pcall(function()
+                if RL:ok() then
+                    RequestBlock:FireServer(false)
+                    RL:mark()
+                end
+            end)
         end)
     end)
 end
@@ -1343,10 +1344,17 @@ RunService.Heartbeat:Connect(function()
                     local eh = ec:FindFirstChildWhichIsA("Humanoid")
                     if er and eh and eh.Health > 0 then
                         local ps = GetPS(p.UserId)
-                        local sc, hvy, atk = Score(p, ps)
-                        if atk then AutoBlock:threat(hvy) end
-                        if sc >= Parry.dynThreshold then
+                        local sc, hvy = Score(p, ps)
+                        if sc > 0 and Dist(MC.root, er) <= 16 and EnemyStriking(ec, eh) then
+                            AutoBlock:threat(hvy)
+                        end
+                        if sc >= Parry.dynThreshold
+                           and not (AutoBlock.active or AutoBlock.pending) then
+                            local before = ps.lastFireT
                             FireParry(p.UserId, hvy, ps)
+                            if ps.lastFireT ~= before then
+                                AutoBlock.parryBusyUntil = os.clock() + (hvy and 0.26 or 0.35)
+                            end
                         end
                     end
                 end
