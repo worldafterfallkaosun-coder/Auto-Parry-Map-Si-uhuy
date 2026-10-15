@@ -1,29 +1,26 @@
 -- ============================================================
---  HIGH SCHOOL ANIME — Combat Tools v9.0 SPECTER
---  by spraxy / VANTA  (rebuilt by Nono)
+--  HIGH SCHOOL ANIME — Combat Tools v9.1 SPECTER
+--  by spraxy / VANTA  (rebuilt + upgraded by Nono)
 --
---  v9 ANTI-DETECT CORE (based on actual AC detection methods):
+--  v9 ANTI-DETECT CORE:
 --  · Human reaction delay gate: 80–220ms before first fire
---    (impossible-speed parries were the main flag)
 --  · Interval variance per tap: no two taps same duration
---    (server checks for robotic interval consistency)
 --  · Burst size randomized 3–8: no fixed pattern fingerprint
 --  · Gamma-distributed inter-burst gap (human fatigue model)
---  · Single priority path: anim > attr > HB (no simultaneous
---    triple-burst spike that shows up in server rate logs)
---  · Per-enemy 95ms reaction gate: prevents same-enemy burst
+--  · Single priority path: anim > attr > HB
+--  · Per-enemy 95ms reaction gate
 --  · Remote name rotates every 75–110s
 --  · Decoy fires full human-timed press→release sequences
 --
---  v9 PARRY ACCURACY:
---  · Anim predictor now at 15% mark (earlier than v8's 18%)
---  · Heavy attack: reaction delay halved (45–110ms)
---  · Score threshold 5→3 (catches more attacks)
---  · FX hooks fire reactive parry even with toggle OFF
---  · Miss streak handler: on 4+ miss streak, full state reset
---    and re-approach with wider burst
+--  v9.1 UPGRADES (parry maximized, no block fallback):
+--  · Combat Lock Neutral — lock reset saat idle (no exchange)
+--  · Combat Lock Active  — lock aktif saat hit exchange
+--  · HP Watch            — incoming hit detection via HP drop
+--  · Outgoing Watch      — detect saat kita ngehit
+--  · Nil guard Heartbeat — fix "attempt to index nil with 'on'"
+--  · v9.0 full parry engine: DoParryBurst, RawParry,
+--    SafeFireInstant, ReactiveParry, WatchChar, FX hooks
 -- ============================================================
-
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
 local UIS          = game:GetService("UserInputService")
@@ -353,6 +350,80 @@ local Lock = {
 local LOCK_SWITCH_HYSTERESIS = 22
 
 -- ============================================================
+--  COMBAT LOCK / NEUTRAL — v9.1
+--  Lock NEUTRAL jika tidak ada hit exchange > HIT_EXCHANGE_TTL
+--  Lock ACTIVE hanya saat incoming atau outgoing hit
+-- ============================================================
+local HIT_EXCHANGE_TTL = 3.2
+
+local CombatLock = {
+    active        = false,
+    lastExchangeT = 0,
+    incomingHit   = false,
+    outgoingHit   = false,
+}
+
+function CombatLock:onIncoming()
+    self.incomingHit   = true
+    self.lastExchangeT = os.clock()
+    self.active        = true
+end
+
+function CombatLock:onOutgoing()
+    self.outgoingHit   = true
+    self.lastExchangeT = os.clock()
+    self.active        = true
+end
+
+function CombatLock:tick()
+    if not self or not self.active then return end
+    local now = os.clock()
+    if now - self.lastExchangeT > HIT_EXCHANGE_TTL then
+        self.active      = false
+        self.incomingHit = false
+        self.outgoingHit = false
+    end
+end
+
+-- ============================================================
+--  HP WATCH — detect incoming hit via HP drop (v9.1)
+-- ============================================================
+local HPWatch = { lastHP=nil, lastHum=nil }
+
+local function SetupHPWatch()
+    local hum = MC.hum
+    if not hum or hum == HPWatch.lastHum then return end
+    HPWatch.lastHum = hum
+    HPWatch.lastHP  = hum.Health
+    hum:GetPropertyChangedSignal("Health"):Connect(function()
+        local cur  = hum.Health
+        local prev = HPWatch.lastHP or cur
+        if cur < prev then
+            CombatLock:onIncoming()
+            MarkCombat()
+        end
+        HPWatch.lastHP = cur
+    end)
+end
+
+-- ============================================================
+--  OUTGOING WATCH — detect saat kita ngehit (v9.1)
+-- ============================================================
+local function WatchOutgoing(char)
+    if not char then return end
+    for _,attrName in ipairs(SELF_ATKS) do
+        pcall(function()
+            char:GetAttributeChangedSignal(attrName):Connect(function()
+                if char:GetAttribute(attrName) == true then
+                    CombatLock:onOutgoing()
+                end
+            end)
+        end)
+    end
+end
+
+
+-- ============================================================
 --  HELPERS
 -- ============================================================
 local function Dist(a,b)
@@ -582,140 +653,6 @@ end
 
 Decoy:schedule()
 Decoy:scheduleSeq()
-
--- ============================================================
---  AUTO BLOCK FALLBACK — v9.1 NEW
---  Priority: Parry > AutoBlock
---  Block turun hanya kalau parry ga fire dalam armTTL window
---  Block hold lognormal: manusiawi, bukan robot-constant
--- ============================================================
-local AutoBlock = {
-    active        = false,
-    holdUntil     = 0,
-    fallbackArmed = false,
-    armTime       = 0,
-    armTTL        = 0.18,
-    cooldown      = 0,
-    cdDuration    = 0.22,
-}
-
-function AutoBlock:arm(isHeavy)
-    if self.active then return end
-    if os.clock() < self.cooldown then return end
-    self.fallbackArmed = true
-    self.armTime       = os.clock()
-    self.armTTL        = isHeavy and 0.10 or 0.18
-end
-
-function AutoBlock:disarm()
-    self.fallbackArmed = false
-    self.active        = false
-    self.holdUntil     = 0
-end
-
-function AutoBlock:tick()
-    if not self then return end
-    local now = os.clock()
-    if self.active and now >= self.holdUntil then
-        pcall(function() RequestBlock:FireServer(false) end)
-        self.active   = false
-        self.cooldown = now + self.cdDuration
-        return
-    end
-    if self.fallbackArmed and not self.active then
-        if now - self.armTime >= self.armTTL then
-            if RL:ok() then
-                local react = ReactionDelay(false) * 0.5
-                task.delay(react, function()
-                    if self.fallbackArmed and not self.active then
-                        pcall(function()
-                            RequestBlock:FireServer(true)
-                            RL:mark()
-                        end)
-                        self.active        = true
-                        self.holdUntil     = os.clock() + LogN(-1.60, 0.25, 0.12, 0.38)
-                        self.fallbackArmed = false
-                    end
-                end)
-            end
-        end
-    end
-end
-
--- ============================================================
---  COMBAT LOCK / NEUTRAL — v9.1 NEW
---  Lock NEUTRAL jika tidak ada hit exchange > HIT_EXCHANGE_TTL
---  Lock ACTIVE hanya saat incoming atau outgoing hit
--- ============================================================
-local HIT_EXCHANGE_TTL = 3.2
-
-local CombatLock = {
-    active        = false,
-    lastExchangeT = 0,
-    incomingHit   = false,
-    outgoingHit   = false,
-}
-
-function CombatLock:onIncoming()
-    self.incomingHit   = true
-    self.lastExchangeT = os.clock()
-    self.active        = true
-end
-
-function CombatLock:onOutgoing()
-    self.outgoingHit   = true
-    self.lastExchangeT = os.clock()
-    self.active        = true
-end
-
-function CombatLock:tick()
-    if not self or not self.active then return end
-    local now = os.clock()
-    if now - self.lastExchangeT > HIT_EXCHANGE_TTL then
-        self.active      = false
-        self.incomingHit = false
-        self.outgoingHit = false
-    end
-end
-
--- ============================================================
---  HP WATCH — detect incoming hit via HP drop (v9.1)
--- ============================================================
-local HPWatch = { lastHP=nil, lastHum=nil }
-
-local function SetupHPWatch()
-    local hum = MC.hum
-    if not hum or hum == HPWatch.lastHum then return end
-    HPWatch.lastHum = hum
-    HPWatch.lastHP  = hum.Health
-    hum:GetPropertyChangedSignal("Health"):Connect(function()
-        local cur  = hum.Health
-        local prev = HPWatch.lastHP or cur
-        if cur < prev then
-            CombatLock:onIncoming()
-            AutoBlock:arm(false)
-            MarkCombat()
-        end
-        HPWatch.lastHP = cur
-    end)
-end
-
--- ============================================================
---  OUTGOING WATCH — detect saat kita ngehit (v9.1)
--- ============================================================
-local function WatchOutgoing(char)
-    if not char then return end
-    for _,attrName in ipairs(SELF_ATKS) do
-        pcall(function()
-            char:GetAttributeChangedSignal(attrName):Connect(function()
-                if char:GetAttribute(attrName) == true then
-                    CombatLock:onOutgoing()
-                end
-            end)
-        end)
-    end
-end
-
 
 -- ============================================================
 --  RAW PARRY — fully lognormal, variance per call
@@ -974,26 +911,10 @@ local lastHBTime=0
 RunService.Heartbeat:Connect(function()
     -- v9.1: nil guard
     if not Parry then return end
-    if not AutoBlock then return end
     if not CombatLock then return end
-    MaybeRotateNames()
-    -- v9.1: tick AutoBlock fallback + CombatLock neutral
-    AutoBlock:tick()
+    -- v9.1: CombatLock neutral tick
     CombatLock:tick()
-    -- v9.1: arm AutoBlock for any nearby threat
-    if MC.root then
-        for _,p in pairs(Players:GetPlayers()) do
-            if p ~= LP and p.Character then
-                local er = p.Character:FindFirstChild("HumanoidRootPart")
-                local eh = p.Character:FindFirstChildWhichIsA("Humanoid")
-                if er and eh and eh.Health > 0 then
-                    local ps = GetPS(p.UserId)
-                    local sc, hvy = Score(p, ps)
-                    if sc >= 2 then AutoBlock:arm(hvy) end
-                end
-            end
-        end
-    end
+    MaybeRotateNames()
     local parryActive=Parry.on or Parry.reactiveMode
     if not parryActive then Decoy:tick(); return end
     if not MC.root then RefreshChar(); return end
@@ -1397,9 +1318,8 @@ local function HookSelf(char)
         hum:GetPropertyChangedSignal("Health"):Connect(function()
             if hum.Health<prevHP then
                 MarkCombat()
-                -- v9.1: incoming hit → CombatLock active + AutoBlock arm
+                -- v9.1: incoming hit → CombatLock active
                 CombatLock:onIncoming()
-                AutoBlock:arm(false)
                 if Lock.on then
                     local now=os.clock()
                     if now-Lock.lastSwitch>=LockCFG.SwitchCooldown then
@@ -1429,7 +1349,6 @@ end
 LP.CharacterAdded:Connect(function(c)
     FullNeutralReset()
     task.wait(0.20); HookSelf(c)
-    -- v9.1: watch outgoing hits
     WatchOutgoing(c)
     SetupHPWatch()
 end)
@@ -1474,7 +1393,7 @@ LP.CharacterAdded:Connect(function()
 end)
 
 -- ============================================================
---  UI v9.1 — PILL + PANEL (original v9 style, updated for v9.1)
+--  UI v9 — PILL + PANEL (same as v8, updated label)
 -- ============================================================
 local old=PGui:FindFirstChild("HSA_UI_v9")
 if old then old:Destroy() end
@@ -1542,10 +1461,9 @@ end
 
 local ParryChip=MkChip("⚔  PARRY  OFF",22)
 local LockChip =MkChip("🔒  LOCK   OFF",54)
-local BlockChip=MkChip("🛡  BLOCK  OFF",86)
 
 local StatLine=Instance.new("TextLabel")
-StatLine.Size=UDim2.new(1,-16,0,11); StatLine.Position=UDim2.new(0,8,0,120)
+StatLine.Size=UDim2.new(1,-16,0,11); StatLine.Position=UDim2.new(0,8,0,86)
 StatLine.BackgroundTransparency=1
 StatLine.TextColor3=Color3.fromRGB(60,60,60); StatLine.TextSize=9
 StatLine.Font=Enum.Font.Gotham
@@ -1553,7 +1471,7 @@ StatLine.TextXAlignment=Enum.TextXAlignment.Left
 StatLine.Text="fps:- p:-ms | P:0 M:0"; StatLine.Parent=Panel
 
 local BarBG=Instance.new("Frame")
-BarBG.Size=UDim2.new(1,-16,0,4); BarBG.Position=UDim2.new(0,8,0,136)
+BarBG.Size=UDim2.new(1,-16,0,4); BarBG.Position=UDim2.new(0,8,0,102)
 BarBG.BackgroundColor3=Color3.fromRGB(26,26,26); BarBG.BorderSizePixel=0; BarBG.Parent=Panel
 Instance.new("UICorner",BarBG).CornerRadius=UDim.new(0,2)
 local BarFill=Instance.new("Frame")
@@ -1563,7 +1481,7 @@ BarFill.BorderSizePixel=0; BarFill.Parent=BarBG
 Instance.new("UICorner",BarFill).CornerRadius=UDim.new(0,2)
 
 local TargetLine=Instance.new("TextLabel")
-TargetLine.Size=UDim2.new(1,-16,0,10); TargetLine.Position=UDim2.new(0,8,0,145)
+TargetLine.Size=UDim2.new(1,-16,0,10); TargetLine.Position=UDim2.new(0,8,0,110)
 TargetLine.BackgroundTransparency=1
 TargetLine.TextColor3=Color3.fromRGB(255,185,55); TargetLine.TextSize=9
 TargetLine.Font=Enum.Font.Gotham
@@ -1572,8 +1490,8 @@ TargetLine.Text=""; TargetLine.Visible=false
 TargetLine.TextTruncate=Enum.TextTruncate.AtEnd; TargetLine.Parent=Panel
 
 local function SetTargetVis(v)
-    if v then Panel.Size=UDim2.new(0,158,0,162); TargetLine.Visible=true
-    else Panel.Size=UDim2.new(0,158,0,152); TargetLine.Visible=false end
+    if v then Panel.Size=UDim2.new(0,158,0,126); TargetLine.Visible=true
+    else Panel.Size=UDim2.new(0,158,0,115); TargetLine.Visible=false end
 end
 
 -- Open/close
@@ -1581,7 +1499,7 @@ local panelOpen=false
 local function OpenPanel()
     panelOpen=true; Panel.Visible=true; Panel.Size=UDim2.new(0,0,0,0)
     TweenService:Create(Panel,TweenInfo.new(0.10,Enum.EasingStyle.Quad,Enum.EasingDirection.Out),
-        {Size=UDim2.new(0,158,0,155)}):Play()
+        {Size=UDim2.new(0,158,0,120)}):Play()
 end
 local function ClosePanel()
     panelOpen=false
@@ -1639,22 +1557,6 @@ local function UpdateUI()
         LockChip.Text="🔒  LOCK   OFF"
         LockChip.TextColor3=Color3.fromRGB(150,150,150)
     end
-    -- v9.1: AutoBlock chip
-    if AutoBlock then
-        if AutoBlock.active then
-            BlockChip.BackgroundColor3=Color3.fromRGB(20,80,155)
-            BlockChip.Text="🛡  BLOCK HOLD"
-            BlockChip.TextColor3=Color3.fromRGB(120,200,255)
-        elseif AutoBlock.fallbackArmed then
-            BlockChip.BackgroundColor3=Color3.fromRGB(120,90,10)
-            BlockChip.Text="🛡  BLOCK ARM"
-            BlockChip.TextColor3=Color3.fromRGB(255,210,80)
-        else
-            BlockChip.BackgroundColor3=Color3.fromRGB(32,32,32)
-            BlockChip.Text="🛡  BLOCK  OFF"
-            BlockChip.TextColor3=Color3.fromRGB(150,150,150)
-        end
-    end
     if Parry.on and Lock.on then PanelStroke.Color=Color3.fromRGB(0,210,150)
     elseif Lock.on then PanelStroke.Color=Color3.fromRGB(20,100,210)
     elseif Parry.on then PanelStroke.Color=Color3.fromRGB(20,140,55)
@@ -1687,9 +1589,7 @@ end)
 ParryChip.MouseButton1Click:Connect(function()
     Parry.on=not Parry.on
     Parry.nextFire=0; Parry.firing=false; spamLock=false; spamLockT=0
-    lastInstantT=0
-    if not Parry.on then AutoBlock:disarm() end
-    UpdateUI()
+    lastInstantT=0; UpdateUI()
 end)
 
 LockChip.MouseButton1Click:Connect(function()
@@ -1703,9 +1603,7 @@ UIS.InputBegan:Connect(function(i,g)
     if i.KeyCode==Enum.KeyCode.RightShift then
         Parry.on=not Parry.on
         Parry.nextFire=0; Parry.firing=false; spamLock=false; spamLockT=0
-        lastInstantT=0
-        if not Parry.on then AutoBlock:disarm() end
-        UpdateUI()
+        lastInstantT=0; UpdateUI()
     end
     if i.KeyCode==Enum.KeyCode.RightControl then
         Lock.on=not Lock.on
@@ -1765,6 +1663,11 @@ do
         or i.UserInputType==Enum.UserInputType.Touch then drag=false end
     end)
 end
+
+-- v9.1 init
+RefreshChar()
+SetupHPWatch()
+if LP.Character then WatchOutgoing(LP.Character) end
 
 UpdateUI()
 print(string.format(
