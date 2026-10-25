@@ -1,4 +1,16 @@
 -- ============================================================
+--  HIGH SCHOOL ANIME — Combat Tools v13.1 WRAITH (hold + eco build)
+--
+--  v13.1 (patch di atas v13.0):
+--  · MODE HEMAT GUARD: hold default lebih pendek (HoldTail 0.08,
+--    HoldUnknown 0.30, HoldHeavy 0.45) dan hold buat animasi yang
+--    BELUM dipelajari dilewati / diputus kalau GuardValue < 0.25
+--    (CFG.EcoSkipLow / EcoGuardLow). Animasi yang udah dipelajari
+--    dan ragdoll tetap jalan.
+--  · LOCK LEBIH LAMA: EXCHANGE_TTL 1.4s -> 8s (lock bertahan ~8,3s
+--    setelah baku hantam terakhir; tetap lepas kalau target invalid
+--    atau lewat Leash).
+--
 --  HIGH SCHOOL ANIME — Combat Tools v13.0 WRAITH (hold build)
 --
 --  v13.0 HOLD (patch di atas v12.0):
@@ -86,9 +98,11 @@ local CFG = {
     -- v13 HOLD
     HoldRefresh     = true,      -- true = refresh block selama jendela; false = pencet sekali lalu tahan
     RefreshMode     = "true",    -- "true" = FireServer(true) berulang | "cycle" = false+true di frame sama
-    HoldTail        = 0.14,      -- tahan segini lama setelah prediksi hit (detik)
-    HoldUnknown     = 0.42,      -- durasi tahan kalau hit-delay animasi belum dipelajari
-    HoldHeavy       = 0.60,      -- sama, buat serangan heavy
+    HoldTail        = 0.08,      -- tahan segini lama setelah prediksi hit (detik) [v13.1: dulu 0.14]
+    HoldUnknown     = 0.30,      -- durasi tahan kalau hit-delay animasi belum dipelajari [dulu 0.42]
+    HoldHeavy       = 0.45,      -- sama, buat serangan heavy [dulu 0.60]
+    EcoSkipLow      = true,      -- hemat guard: lewati/putus hold animasi yang belum dipelajari kalau guard rendah
+    EcoGuardLow     = 0.25,      -- batas GuardValue (0..1) buat mode hemat
     HoldRagdoll     = 0.32,      -- sama, pas ragdoll
     RefireGap       = 0.05,      -- jeda minimal antar request parry (dulu 0.30)
 }
@@ -576,7 +590,7 @@ local Lock = {
     lastAtk=nil, lastAtkT=0,
     lastHitTgt=nil, lastHitTgtT=0,
 }
-local EXCHANGE_TTL = 1.4
+local EXCHANGE_TTL = 8.0   -- v13.1: dulu 1.4 (lock bertahan ~TTL+0.3 detik setelah baku hantam terakhir)
 
 -- own swing timestamp (a swing alone does NOT lock; a landed hit does)
 local lastSelfAtkT = 0
@@ -827,11 +841,11 @@ local function HoldInterval()
     return math.max(0.040, 1 / (cap * 0.85))
 end
 
-local function HoldActive(now)
+local function HoldActive(now, gv)
     local act = false
     for k = #Hold.win, 1, -1 do
         local w = Hold.win[k]
-        if now >= w.e then
+        if now >= w.e or (w.u and CFG.EcoSkipLow and gv < CFG.EcoGuardLow) then
             table.remove(Hold.win, k)
         elseif now >= w.s then
             act = true
@@ -865,8 +879,10 @@ local function HoldLoop()
                 break
             end
             local now = os.clock()
-            local act = HoldActive(now)
             local char = LP.Character
+            local gv = char and char:GetAttribute("GuardValue")
+            if typeof(gv) ~= "number" then gv = 1 end
+            local act = HoldActive(now, gv)
             local broken = char and char:GetAttribute("GuardBroken") == true
             if act and not broken then
                 local gap = 0
@@ -889,11 +905,11 @@ local function HoldLoop()
     end)
 end
 
-local function HoldRequest(s, e)
+local function HoldRequest(s, e, unk)
     for _, w in ipairs(Hold.win) do
         if math.abs(w.s - s) < 0.010 and math.abs(w.e - e) < 0.010 then return end
     end
-    Hold.win[#Hold.win + 1] = { s = s, e = e }
+    Hold.win[#Hold.win + 1] = { s = s, e = e, u = unk }
     HoldLoop()
 end
 
@@ -939,12 +955,20 @@ local function DoBurst(heavy, urg, track, ovr, name, t0)
         e = predicted + CFG.HoldTail
         Parry.nextFire = math.max(Parry.nextFire, now + CFG.RefireGap)
     else
+        if not isRDL and CFG.EcoSkipLow then
+            local ch = LP.Character
+            local gv = ch and ch:GetAttribute("GuardValue")
+            if typeof(gv) == "number" and gv < CFG.EcoGuardLow then
+                ClearSL()
+                return
+            end
+        end
         local dur = isRDL and CFG.HoldRagdoll or (heavy and CFG.HoldHeavy or CFG.HoldUnknown)
         s = now + 0.004
         e = s + dur
     end
 
-    HoldRequest(math.max(s, now + 0.002), math.max(e, now + 0.05))
+    HoldRequest(math.max(s, now + 0.002), math.max(e, now + 0.05), (not predicted) and (not isRDL))
     if isRDL then task.delay(0.065, ClearSL) else ClearSL() end
 end
 
