@@ -1,4 +1,16 @@
 -- ============================================================
+--  HIGH SCHOOL ANIME — Combat Tools v13.2 WRAITH (hold + eco + guard-aware)
+--
+--  v13.2 (patch di atas v13.1):
+--  · REFRESH DIBATASI: tiap jendela hit cuma boleh kirim block
+--    1x (pencet) + CFG.RefreshMax refresh (default 2), bukan terus-
+--    terusan. Tujuannya nurunin biaya guard per parry (parry manual
+--    = ~26 poin guard, v13 lewat script = ~50).
+--  · EcoGuardLow 0.25 -> 0.35 (satu parry ~0.26, jadi 0.25 terlalu mepet).
+--  · GUARD LOG: tiap GuardValue turun, console nge-print berapa turunnya
+--    plus status hold (CFG.GuardLog = false buat mematikan). Pakai ini
+--    buat nentuin RefreshMax / HoldRefresh yang pas.
+--
 --  HIGH SCHOOL ANIME — Combat Tools v13.1 WRAITH (hold + eco build)
 --
 --  v13.1 (patch di atas v13.0):
@@ -102,7 +114,9 @@ local CFG = {
     HoldUnknown     = 0.30,      -- durasi tahan kalau hit-delay animasi belum dipelajari [dulu 0.42]
     HoldHeavy       = 0.45,      -- sama, buat serangan heavy [dulu 0.60]
     EcoSkipLow      = true,      -- hemat guard: lewati/putus hold animasi yang belum dipelajari kalau guard rendah
-    EcoGuardLow     = 0.25,      -- batas GuardValue (0..1) buat mode hemat
+    EcoGuardLow     = 0.35,      -- batas GuardValue (0..1) buat mode hemat [v13.2: dulu 0.25]
+    RefreshMax      = 2,         -- refresh maksimal per jendela hit setelah pencet pertama (0 = pencet sekali)
+    GuardLog        = true,      -- print tiap GuardValue turun (buat tuning)
     HoldRagdoll     = 0.32,      -- sama, pas ragdoll
     RefireGap       = 0.05,      -- jeda minimal antar request parry (dulu 0.30)
 }
@@ -828,11 +842,12 @@ Decoy:sch(); Decoy:schS()
 --  win = daftar {s=mulai, e=selesai} (os.clock). Loop per-frame
 --  nahan/refresh block selama ada jendela aktif, lepas kalau habis.
 -- ============================================================
-local Hold = { win = {}, loop = false, down = false, lastTrue = 0 }
+local Hold = { win = {}, loop = false, down = false, lastTrue = 0, sent = 0, lastSent = 0 }
 
 local function HoldRelease()
     if not Hold.down then return end
     Hold.down = false
+    Hold.lastSent = Hold.sent; Hold.sent = 0
     pcall(function() RequestBlock:FireServer(false) end)
 end
 
@@ -865,8 +880,23 @@ local function HoldSend()
         pcall(function() RequestBlock:FireServer(true) end)
         RL:mark()
     end
-    Hold.lastTrue = os.clock()
+    local t = os.clock()
+    Hold.lastTrue = t
     Hold.down = true
+    Hold.sent = Hold.sent + 1
+    for _, w in ipairs(Hold.win) do
+        if t >= w.s then w.n = (w.n or 0) + 1 end
+    end
+end
+
+-- true kalau perlu kirim: belum ada block turun, atau ada jendela aktif yang
+-- jatah refresh-nya (RefreshMax) belum habis
+local function HoldWants(now)
+    if not Hold.down then return true end
+    for _, w in ipairs(Hold.win) do
+        if now >= w.s and now < w.e and (w.n or 0) < CFG.RefreshMax + 1 then return true end
+    end
+    return false
 end
 
 local function HoldLoop()
@@ -887,7 +917,7 @@ local function HoldLoop()
             if act and not broken then
                 local gap = 0
                 if Hold.down then gap = CFG.HoldRefresh and HoldInterval() or 9e9 end
-                if now - Hold.lastTrue >= gap and RL:ok() then
+                if now - Hold.lastTrue >= gap and HoldWants(now) and RL:ok() then
                     HoldSend()
                 end
             elseif Hold.down and #Hold.win > 0 and not act then
@@ -920,6 +950,26 @@ local function HoldParried()
         if Hold.win[k].s <= now + 0.05 then table.remove(Hold.win, k) end
     end
 end
+
+-- ============================================================
+--  GUARD LOG (v13.2) — print tiap GuardValue turun
+-- ============================================================
+local function GuardLogHook(char)
+    if not CFG.GuardLog or not char then return end
+    local last = char:GetAttribute("GuardValue")
+    if typeof(last) ~= "number" then last = 1 end
+    char:GetAttributeChangedSignal("GuardValue"):Connect(function()
+        local v = char:GetAttribute("GuardValue")
+        if typeof(v) ~= "number" then return end
+        if v < last - 0.005 then
+            print(string.format("[GUARD] %.2f -> %.2f (-%.2f) | hold=%s sends=%d prev=%d win=%d",
+                last, v, last - v, tostring(Hold.down), Hold.sent, Hold.lastSent, #Hold.win))
+        end
+        last = v
+    end)
+end
+GuardLogHook(LP.Character)
+LP.CharacterAdded:Connect(GuardLogHook)
 
 -- ============================================================
 --  SPAM LOCK (dipertahankan buat kompatibilitas; DoBurst gak pakai lagi)
