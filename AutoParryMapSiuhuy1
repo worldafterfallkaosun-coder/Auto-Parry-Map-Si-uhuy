@@ -1,15 +1,18 @@
 -- ============================================================
---  HIGH SCHOOL ANIME — Combat Tools v11.0 WRAITH
---  upgraded by Nono
+--  HIGH SCHOOL ANIME — Combat Tools v11.1 WRAITH
+--  (v11.0 by Nono, merged patch v11.1)
 --
---  v11 CORE FIXES:
---  · Parry timing fully driven by live FPS+Ping formula
---  · Tap duration & burst tightened per actual frametime
---  · Pre-arm fires at anim frame 0, heavy attr, and HP drop simultaneously
---  · Lock TRUE NEUTRAL: Lock.target=nil at all times unless exchange is LIVE
---  · CombatLock.active only set by onIncoming/onOutgoing, never by scan
---  · ProxCheck, BuildQueue, heartbeat scan NEVER call LockOn when idle
---  · UI stripped: pill only, small panel, no decorative fluff
+--  v11.1 CHANGES:
+--  · Lock: instant (no task.defer), snaps aim on hit
+--  · Lock: ONLY triggers on real hit-in / real hit-out
+--      hit-in  = your HP dropped (attacker = recent attacker)
+--      hit-out = enemy HP dropped within 0.7s of your swing
+--  · Swinging alone no longer locks
+--  · Exchange TTL 5.0s -> 1.4s (back to neutral fast)
+--  · No auto target-switching (switch only via new hit)
+--  · Prediction fix (vel * pred, not vel * pred * dt)
+--  · Parry: burst 2-6 taps instead of 9-16 (less spam / RL)
+--  · Parry: removed late HP-drop prearm
 -- ============================================================
 
 local Players     = game:GetService("Players")
@@ -102,33 +105,21 @@ local function GetJitter() _pingUpdate(); return Ping.jit  end
 
 -- ============================================================
 --  CORE TIMING — everything derived from live FPS + Ping
---
---  These are the ONLY formulas parry uses.
---  No magic constants — all values scale with actual conditions.
 -- ============================================================
-
--- How far ahead to start the parry sequence (lead the server)
 local function PingLead()
     local p = GetPing(); local j = GetJitter()
-    -- base: linear from ping, clamped
-    -- extra: jitter penalty so unstable net fires earlier
     return math.clamp((p - 20) / 850 * 3.5, 0.003, 0.26)
          + math.clamp(j / 1600, 0, 0.032)
          + math.clamp(math.max(0, Ping.ema - p) / 1800, 0, 0.014)
 end
 
--- How long to hold block key per tap
--- FPS high → shorter tap (server sees it faster)
--- Ping high → longer tap (block needs to survive latency window)
 local function TapDuration(urgency)
     local fps = math.max(FPS.v, 10)
     local p   = GetPing(); local j = GetJitter()
 
-    -- base range: tighter at high FPS, wider at high ping
     local lo = math.clamp(0.022 - (fps - 30)/1800, 0.009, 0.022)
     local hi = math.clamp(0.055 + (p - 50)/1800 + j/2500, 0.030, 0.095)
 
-    -- urgency compression
     local scLo, scHi =
         (urgency == "ragdoll" or urgency == "prearm") and 0.52 or
         (urgency == "instant")                         and 0.62 or
@@ -142,41 +133,19 @@ local function TapDuration(urgency)
     return lo + (hi - lo) * math.random()
 end
 
--- How many taps per burst
--- More taps at high FPS (server can process them), fewer when ping is high
+-- v11.1: compact bursts (was 9-16 taps)
 local function BurstCount(heavy, urgency, cap)
-    local fps = FPS.v; local p = GetPing(); local j = GetJitter()
-    local lo, hi
-
-    if urgency == "ragdoll" then
-        lo, hi = 9, 16
-    elseif urgency == "prearm" or urgency == "instant" then
-        lo = heavy and 7 or 6
-        hi = heavy and 15 or 12
-    elseif heavy then
-        lo = fps > 90 and 6 or 5
-        hi = fps > 90 and 13 or 10
-    else
-        lo = fps > 90 and 5 or 4
-        hi = fps > 90 and 10 or 8
-    end
-
-    -- jitter penalty: unstable net = reduce max
-    if j > 30 then hi = math.max(lo, hi - 2) end
-    -- high ping penalty
-    if p > 190 then hi = math.max(lo, hi - 1) end
-
-    return math.min(math.random(lo, hi), cap or math.huge)
+    local n = (urgency == "ragdoll") and math.random(4, 6)
+        or heavy and math.random(3, 5)
+        or math.random(2, 4)
+    return math.min(n, cap or math.huge)
 end
 
--- Reaction delay before first tap
--- Pre-arm fires before impact; normal fires human-like delay
 local function ReactDelay(heavy, urgency)
     local fps = FPS.v
     local fsc = math.clamp((fps - 30) / 140, 0, 0.50)
 
     if urgency == "prearm" then
-        -- fire before attack lands: 4-20ms
         return math.clamp(0.004 + math.random() * 0.016, 0.004, 0.020)
     elseif urgency == "ragdoll" or urgency == "instant" then
         return math.clamp(0.006 + math.random() * 0.022, 0.006, 0.028)
@@ -193,11 +162,9 @@ local function ReactDelay(heavy, urgency)
     end
 end
 
--- Cooldown between bursts
 local function BurstCD(heavy)
     local p    = GetPing()
     local base = heavy and 0.075 or 0.100
-    -- scale down with ping (high ping = server already slow = shorter CD needed)
     if p > 240 then return math.max(base * 0.20, base - 0.090)
     elseif p > 180 then return math.max(base * 0.32, base - 0.068)
     elseif p > 120 then return math.max(base * 0.48, base - 0.048)
@@ -295,6 +262,7 @@ local function GPS(uid)
         kPos=nil, kVel=Vector3.zero, kT=0,
         lastFireT=0, missStreak=0,
         preArmActive=false, preArmExp=0,
+        atkT=0, -- v11.1: last time this player started an attack
     } end
     return PS[uid]
 end
@@ -319,7 +287,6 @@ end
 
 -- ============================================================
 --  FIRE QUEUE — priority sorted
---  prearm=6 > ragdoll=5 > instant=4 > reactive=3 > normal=2
 -- ============================================================
 local FQ = {q={}, last=0, gap=0.016}
 local PRI = {prearm=6, ragdoll=5, instant=4, reactive=3, combo=3, normal=2, idle=1}
@@ -359,19 +326,14 @@ local Parry = {
 local LCFG = {
     Range=26, Leash=34, Dur=80,
     SwCd=0.40, Pred=0.14,
-    Resp=48, MaxTorque=1e6, ProxR=14,
+    Resp=140, MaxTorque=1e6, ProxR=14,   -- v11.1: Resp 48 -> 140
 }
 
 -- ============================================================
 --  LOCK STATE — TRUE NEUTRAL
---
---  Lock.on=true  + Lock.target=nil  → NEUTRAL  (no aim, no constraint)
---  Lock.on=true  + Lock.target=X   → ACTIVE   (aim + AlignOrientation)
---  Lock.on=false                   → OFF
---
 --  Lock.target is ONLY set inside LockOn().
---  LockOn() ONLY runs from CombatLock:onIncoming / :onOutgoing.
---  NOTHING ELSE sets Lock.target. Ever.
+--  LockOn() ONLY runs from CL:onIncoming / CL:onOutgoing
+--  (and the manual toggle while an exchange is live).
 -- ============================================================
 local Lock = {
     on=false, target=nil, expT=0,
@@ -382,63 +344,64 @@ local Lock = {
     lastAtk=nil, lastAtkT=0,
     lastHitTgt=nil, lastHitTgtT=0,
 }
-local SWITCH_HYS = 14
-local EXCHANGE_TTL = 5.0  -- neutral after 5s no exchange
+local EXCHANGE_TTL = 1.4  -- v11.1: neutral 1.4s after the last real hit
 
--- CombatLock: tracks whether an exchange is LIVE
+-- own swing timestamp (a swing alone does NOT lock; a landed hit does)
+local lastSelfAtkT = 0
+local function MarkSwing() lastSelfAtkT = os.clock() end
+
 local CL = {active=false, lastT=0, count=0}
 
--- forward declarations
 local LockOn, UnlockTarget, FullOff, GetBest
 
 -- ============================================================
---  COMBAT LOCK METHODS
---  These are the ONLY entry points that set Lock.target
+--  FIND ATTACKER — who actually hit / is hitting me
+--  Prefers players who started an attack in the last 0.5s,
+--  then closest.
+-- ============================================================
+local function FindAttacker()
+    local root = MC.root; if not root then return nil end
+    local now, best, bestS = os.clock(), nil, -1
+    for _, p in ipairs(Players:GetPlayers()) do
+        local c = p ~= LP and p.Character
+        local er = c and c:FindFirstChild("HumanoidRootPart")
+        local eh = c and c:FindFirstChildWhichIsA("Humanoid")
+        if er and eh and eh.Health > 0 then
+            local d = (root.Position - er.Position).Magnitude
+            if d <= LCFG.Range then
+                local age = now - (GPS(p.UserId).atkT or 0)
+                local s = (age < 0.5 and (100 - age * 100) or 0) + (LCFG.Range - d)
+                if s > bestS then bestS, best = s, p end
+            end
+        end
+    end
+    return best
+end
+
+-- ============================================================
+--  COMBAT LOCK METHODS — instant, no defer
 -- ============================================================
 function CL:onIncoming(hint)
     self.lastT  = os.clock()
     self.active = true
     self.count  = self.count + 1
-    task.defer(function()
-        if not Lock.on then return end
-        local t = hint
-        if not t then
-            -- find nearest attacker
-            local root=MC.root; local cd=LCFG.Range; local best=nil
-            if root then
-                for _,p in pairs(Players:GetPlayers()) do
-                    if p~=LP and p.Character then
-                        local er=p.Character:FindFirstChild("HumanoidRootPart")
-                        local eh=p.Character:FindFirstChild("Humanoid")
-                        if er and eh and eh.Health>0 then
-                            local d=(root.Position-er.Position).Magnitude
-                            if d<cd then cd=d; best=p end
-                        end
-                    end
-                end
-            end
-            t = best or GetBest(true)
-        end
-        if t then Lock.lastAtk=t; Lock.lastAtkT=os.clock(); LockOn(t) end
-    end)
+    if not Lock.on then return end
+    local t = hint or FindAttacker()
+    if t then Lock.lastAtk = t; Lock.lastAtkT = os.clock(); LockOn(t) end
 end
 
 function CL:onOutgoing(hint)
     self.lastT  = os.clock()
     self.active = true
     self.count  = self.count + 1
-    task.defer(function()
-        if not Lock.on then return end
-        local t = hint or GetBest(true)
-        if t then Lock.lastHitTgt=t; Lock.lastHitTgtT=os.clock(); LockOn(t) end
-    end)
+    if not Lock.on or not hint then return end
+    Lock.lastHitTgt = hint; Lock.lastHitTgtT = os.clock(); LockOn(hint)
 end
 
 function CL:tick()
     if not self.active then return end
     if os.clock() - self.lastT > EXCHANGE_TTL then
         self.active = false; self.count = 0
-        -- go neutral: kill target, keep Lock.on
         if Lock.on and Lock.target then UnlockTarget() end
     end
 end
@@ -455,18 +418,6 @@ local function SetupHPW()
         if cur < prev then CL:onIncoming(nil) end
         HPW.hp=cur
     end)
-end
-
--- outgoing self-attack watch
-local function WatchOutgoing(char)
-    if not char then return end
-    for _,a in ipairs(SELF_ATKS) do
-        pcall(function()
-            char:GetAttributeChangedSignal(a):Connect(function()
-                if char:GetAttribute(a)==true then CL:onOutgoing(nil) end
-            end)
-        end)
-    end
 end
 
 -- ============================================================
@@ -546,7 +497,6 @@ local function Score(p, ps)
     if Lock.lastHitTgt==p and now-Lock.lastHitTgtT<10 then sc=sc+26 end
     if ps.preArmActive and now<ps.preArmExp then sc=sc+45;hvy=true end
 
-    -- vel approach bonus
     local vel=er.Velocity; local acc=(vel-ps.prevVel).Magnitude; ps.prevVel=vel
     if acc>=3.5 then
         local toMe=root.Position-er.Position
@@ -627,10 +577,8 @@ local function DoBurst(heavy, urg, track, ovr)
     count = math.max(count, 2)
 
     task.spawn(function()
-        -- reaction delay, offset by ping lead
         local react = ReactDelay(heavy, urg)
         if track and not isFst then
-            -- anim window prediction: how far before impact
             local ok,dur=pcall(function() return track.Length end)
             if ok and dur and dur>0 then
                 local ahead = math.max(0,(dur*0.18 - track.TimePosition)/math.max(track.Speed,0.01))
@@ -648,7 +596,6 @@ local function DoBurst(heavy, urg, track, ovr)
             end
             RawParry(TapDuration(urg), urg)
             if i < count then
-                -- inter-tap interval: gamma distributed, scales with FPS
                 local sc = isRDL and 0.013 or 0.024
                 local iv = gamma(isRDL and 1.0 or (1.2+(i/count)*0.5), sc)
                 task.wait(math.clamp(iv, isRDL and 0.006 or 0.010, 0.068))
@@ -748,8 +695,7 @@ local function TryPreArm(ps, uid, animName, heavy)
 end
 
 -- ============================================================
---  HEARTBEAT — parry scan
---  NOTE: BuildQueue only feeds FireParry, NEVER calls LockOn
+--  HEARTBEAT — parry scan (never touches the lock)
 -- ============================================================
 local _hbT=0
 RunService.Heartbeat:Connect(function()
@@ -764,7 +710,6 @@ RunService.Heartbeat:Connect(function()
     local sr=rdl and 0.001 or math.max(0.002, FPS.ft*0.80)
     if now-_hbT<sr then return end; _hbT=now
 
-    -- vel pre-fire scan (parry only, no lock)
     for _,p in pairs(Players:GetPlayers()) do
         if p~=LP and p.Character then
             local er=p.Character:FindFirstChild("HumanoidRootPart")
@@ -790,7 +735,6 @@ RunService.Heartbeat:Connect(function()
     if not Parry.on then return end
     if not rdl and now<Parry.nextFire then return end
 
-    -- build score queue (parry targeting only)
     local q={}
     for _,p in pairs(Players:GetPlayers()) do
         if p~=LP then
@@ -820,13 +764,14 @@ local function WatchChar(p, char)
     local function watchAnim(anim)
         pcall(function()
             anim.AnimationPlayed:Connect(function(track)
-                if not (Parry.on or Parry.reactMode) then return end
                 if not track then return end
-                if not RDL.on and IsSelfAtk() then return end
                 local ok,n=pcall(function() return track.Animation.Name end)
                 if not ok or not n then return end
                 local H=isM2(n); local M=isM1(n)
                 if not H and not M then return end
+                GPS(uid).atkT=os.clock()   -- v11.1: record attacker (before parry gates)
+                if not (Parry.on or Parry.reactMode) then return end
+                if not RDL.on and IsSelfAtk() then return end
                 local er=char:FindFirstChild("HumanoidRootPart")
                 if not er or not MC.root then return end
                 if Dist(MC.root,er)>26 or FromBack(er) then return end
@@ -834,7 +779,6 @@ local function WatchChar(p, char)
                 local ck=uid.."_"..n
                 if now-(ps.lastAnimFire[ck] or 0)<0.075 then return end
                 ps.lastAnimFire[ck]=now
-                -- pre-arm on frame 0
                 if track.TimePosition<=0.020 then TryPreArm(ps,uid,n,H) end
                 UpdateCombo(ps,uid,H,n)
                 if H then
@@ -850,10 +794,11 @@ local function WatchChar(p, char)
     local function onAttr(obj, a)
         pcall(function()
             obj:GetAttributeChangedSignal(a):Connect(function()
-                if not (Parry.on or Parry.reactMode) then return end
-                if not RDL.on and IsSelfAtk() then return end
                 local v=obj:GetAttribute(a)
                 if not (v==true or (type(v)=="string" and (v:lower():find("attack") or v:lower():find("heavy")))) then return end
+                if a~="FightMode" then GPS(uid).atkT=os.clock() end  -- v11.1
+                if not (Parry.on or Parry.reactMode) then return end
+                if not RDL.on and IsSelfAtk() then return end
                 local er=char:FindFirstChild("HumanoidRootPart")
                 if not er or not MC.root then return end
                 if Dist(MC.root,er)>26 or FromBack(er) then return end
@@ -883,6 +828,20 @@ local function WatchChar(p, char)
     end
     for _,a in ipairs(ALL_ATTR) do
         onAttr(char,a); if eh then onAttr(eh,a) end
+    end
+
+    -- v11.1: outgoing lock ONLY when my swing actually dropped their HP
+    if eh then
+        local ph = eh.Health
+        eh:GetPropertyChangedSignal("Health"):Connect(function()
+            local h = eh.Health
+            local er = char:FindFirstChild("HumanoidRootPart")
+            if h < ph and os.clock() - lastSelfAtkT < 0.7 and er and MC.root
+               and Dist(MC.root, er) <= LCFG.Range and not FromBack(er) then
+                CL:onOutgoing(p)
+            end
+            ph = h
+        end)
     end
 end
 
@@ -917,8 +876,7 @@ if ReactionFX then
                 end
             end
         end
-        -- lock: only via CL:onIncoming (exchange gate)
-        if cls and Lock.on then CL:onIncoming(cls) end
+        if Lock.on then CL:onIncoming(cls) end
         if Parry.on then FQ:push("instant",false,nil) else
             Parry.reactMode=true; Parry.preArmExp=os.clock()+0.40
             FQ:push("reactive",false,nil)
@@ -1036,15 +994,6 @@ GetBest = function(rescan)
     return best
 end
 
-local function ShouldSw(new)
-    if not Lock.target or not ValidTgt(Lock.target) then return true end
-    if new==Lock.target then return false end
-    local cs,_=Score(Lock.target,GPS(Lock.target.UserId))
-    local ns,_=Score(new,GPS(new.UserId))
-    return (ns-cs)>SWITCH_HYS
-end
-
--- v11 TRUE NEUTRAL: Lock.on never auto-false
 -- UnlockTarget = neutral (target nil, Lock.on unchanged)
 UnlockTarget = function()
     Lock.target=nil; Lock.prevPos=nil; Lock.vel=Vector3.zero
@@ -1058,52 +1007,40 @@ FullOff = function()
 end
 
 -- THE ONLY FUNCTION THAT SETS Lock.target
--- Only called from CL:onIncoming / CL:onOutgoing
+-- v11.1: snaps aim immediately on lock
 LockOn = function(t)
-    if not t or not Lock.on then return end
-    -- HARD GATE: must be in active exchange
-    if not CL.active then return end
-    local isNew=(t~=Lock.target)
-    Lock.target=t; Lock.expT=os.clock()+LCFG.Dur
-    Lock.prevPos=nil; Lock.vel=Vector3.zero
-    if isNew then SetupCon() end
+    if not t or not Lock.on or not CL.active then return end
+    local isNew = t ~= Lock.target
+    Lock.target = t; Lock.expT = os.clock() + EXCHANGE_TTL + 0.3
+    if isNew then Lock.prevPos=nil; Lock.vel=Vector3.zero end
+    SetupCon()
+    local er = t.Character and t.Character:FindFirstChild("HumanoidRootPart")
+    if er then SetAim(er.Position + Vector3.new(0,1.5,0)) end
     MarkCombat()
 end
 
 -- ============================================================
 --  LOCK HEARTBEAT
---  Only manages aim + expiry. NEVER calls LockOn on its own.
+--  Aim + expiry only. No auto-switching. Never calls LockOn.
 -- ============================================================
 RunService.Heartbeat:Connect(function(dt)
     if os.clock()-Lock.combatT>5.0 then Lock.inCombat=false end
     if not Lock.on then return end
 
-    -- if no active exchange → force neutral
     if not CL.active then
         if Lock.target then UnlockTarget() end
         return
     end
 
-    -- expire or invalid target → neutral
     if Lock.target and os.clock()>Lock.expT then UnlockTarget(); return end
     if Lock.target and not ValidTgt(Lock.target) then UnlockTarget(); return end
-
-    -- switch if score says so (exchange must still be active)
-    if Lock.target then
-        local best=GetBest(true)
-        if best and ShouldSw(best) then
-            -- switch only via CL (refresh TTL)
-            Lock.target=best; Lock.expT=os.clock()+LCFG.Dur
-            SetupCon(); MarkCombat()
-        end
-    end
 
     if not Lock.target then return end
 
     local ec=Lock.target.Character; if not ec then return end
     local er=ec:FindFirstChild("HumanoidRootPart"); if not er then return end
     UpdVel(er.Position)
-    local ap=er.Position+Lock.vel*LCFG.Pred*dt
+    local ap=er.Position+Lock.vel*LCFG.Pred   -- v11.1: removed extra *dt
     SetAim(Vector3.new(ap.X, ap.Y+1.5, ap.Z))
 end)
 
@@ -1113,13 +1050,12 @@ end)
 local function HookSelf(char)
     if not char then return end
     local hum=char:FindFirstChildWhichIsA("Humanoid")
+    -- v11.1: swing only marks timestamp; lock happens when the hit lands
     for _,a in ipairs(SELF_ATKS) do
         pcall(function()
             char:GetAttributeChangedSignal(a):Connect(function()
                 if char:GetAttribute(a)==true then
-                    MarkCombat()
-                    -- outgoing attack → trigger CL (which will call LockOn)
-                    if Lock.on then CL:onOutgoing(nil) end
+                    MarkCombat(); MarkSwing()
                 end
             end)
         end)
@@ -1152,21 +1088,11 @@ local function HookSelf(char)
                 end)
             else task.delay(0.065,function() SetRDL(false) end) end
         end)
-        local prevHP=hum.Health; local cHitT={}; local lastCPT=0
+        -- v11.1: HP drop = real hit-in -> lock attacker. (late prearm removed)
+        local prevHP=hum.Health
         hum:GetPropertyChangedSignal("Health"):Connect(function()
             if hum.Health<prevHP then
                 MarkCombat(); CL:onIncoming(nil)
-                local now=os.clock()
-                cHitT[#cHitT+1]=now
-                local f={}; for _,t in ipairs(cHitT) do if now-t<0.65 then f[#f+1]=t end end
-                cHitT=f
-                if #cHitT>=2 and now-lastCPT>0.095 then
-                    lastCPT=now
-                    task.delay(0.005,function()
-                        Parry.nextFire=0; Parry.firing=false; ClearSL()
-                        if Parry.on then FQ:push("prearm",false,nil) end
-                    end)
-                end
             end
             prevHP=hum.Health
         end)
@@ -1175,23 +1101,22 @@ end
 
 LP.CharacterAdded:Connect(function(c)
     UnlockTarget(); CL.active=false; CL.count=0
-    task.wait(0.16); HookSelf(c); WatchOutgoing(c); SetupHPW()
+    task.wait(0.16); HookSelf(c); SetupHPW()
 end)
-if LP.Character then HookSelf(LP.Character); WatchOutgoing(LP.Character); SetupHPW() end
+if LP.Character then HookSelf(LP.Character); SetupHPW() end
 Players.PlayerRemoving:Connect(function(p) if Lock.target==p then UnlockTarget() end end)
 
+-- (v11.1: no longer wipes PS on respawn — it orphaned the listeners
+--  and caused duplicate watchers)
 LP.CharacterAdded:Connect(function()
-    RefreshChar(); lastInstantT=0
-    for uid in pairs(PS) do PS[uid]=nil end
+    RefreshChar()
     task.wait(0.40); WatchAll()
     task.wait(0.08); Decoy:sch(); Decoy:schS()
     task.wait(0.04); SetupHPW()
 end)
 
 -- ============================================================
---  UI v11 — MINIMAL
---  Pill only. Click to toggle panel (small, clean).
---  No decorative elements.
+--  UI — MINIMAL
 -- ============================================================
 local old=PGui:FindFirstChild("WRAITH_UI"); if old then old:Destroy() end
 
@@ -1200,7 +1125,6 @@ SG.Name="WRAITH_UI"; SG.ResetOnSpawn=false
 SG.IgnoreGuiInset=true; SG.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
 SG.Parent=PGui
 
--- pill
 local Pill=Instance.new("TextButton")
 Pill.Size=UDim2.new(0,38,0,24); Pill.Position=UDim2.new(0,12,0.5,-12)
 Pill.BackgroundColor3=Color3.fromRGB(14,14,14); Pill.BackgroundTransparency=0.06
@@ -1210,7 +1134,6 @@ Pill.BorderSizePixel=0; Pill.ZIndex=10; Pill.Active=true; Pill.Parent=SG
 Instance.new("UICorner",Pill).CornerRadius=UDim.new(1,0)
 local PS2=Instance.new("UIStroke",Pill); PS2.Thickness=1; PS2.Color=Color3.fromRGB(45,45,45)
 
--- panel (minimal)
 local Panel=Instance.new("Frame")
 Panel.Size=UDim2.new(0,160,0,110); Panel.Position=UDim2.new(0,56,0.5,-55)
 Panel.BackgroundColor3=Color3.fromRGB(9,9,9); Panel.BackgroundTransparency=0.08
@@ -1218,7 +1141,6 @@ Panel.BorderSizePixel=0; Panel.Visible=false; Panel.Active=true; Panel.Parent=SG
 Instance.new("UICorner",Panel).CornerRadius=UDim.new(0,8)
 local PStr=Instance.new("UIStroke",Panel); PStr.Thickness=1; PStr.Color=Color3.fromRGB(38,38,38)
 
--- drag handle
 local DH=Instance.new("Frame")
 DH.Size=UDim2.new(1,0,0,16); DH.BackgroundColor3=Color3.fromRGB(13,13,13)
 DH.BorderSizePixel=0; DH.Parent=Panel
@@ -1230,9 +1152,8 @@ local DHL=Instance.new("TextLabel"); DHL.Size=UDim2.new(1,-6,1,0)
 DHL.Position=UDim2.new(0,6,0,0); DHL.BackgroundTransparency=1
 DHL.TextColor3=Color3.fromRGB(55,55,55); DHL.TextSize=8
 DHL.Font=Enum.Font.GothamBold; DHL.TextXAlignment=Enum.TextXAlignment.Left
-DHL.Text="WRAITH v11.0"; DHL.Parent=DH
+DHL.Text="WRAITH v11.1"; DHL.Parent=DH
 
--- chip builder
 local function Chip(txt,y)
     local b=Instance.new("TextButton")
     b.Size=UDim2.new(1,-12,0,24); b.Position=UDim2.new(0,6,0,y)
@@ -1247,7 +1168,6 @@ end
 local PC=Chip("PARRY  OFF",19)
 local LC=Chip("LOCK   OFF",47)
 
--- info line
 local Info=Instance.new("TextLabel")
 Info.Size=UDim2.new(1,-12,0,11); Info.Position=UDim2.new(0,6,0,76)
 Info.BackgroundTransparency=1; Info.TextColor3=Color3.fromRGB(48,48,48)
@@ -1255,7 +1175,6 @@ Info.TextSize=8; Info.Font=Enum.Font.Gotham
 Info.TextXAlignment=Enum.TextXAlignment.Left
 Info.Text=""; Info.Parent=Panel
 
--- status line
 local SL=Instance.new("TextLabel")
 SL.Size=UDim2.new(1,-12,0,10); SL.Position=UDim2.new(0,6,0,90)
 SL.BackgroundTransparency=1; SL.TextColor3=Color3.fromRGB(40,40,40)
@@ -1263,7 +1182,6 @@ SL.TextSize=8; SL.Font=Enum.Font.Gotham
 SL.TextXAlignment=Enum.TextXAlignment.Left
 SL.Text="idle · neutral"; SL.Parent=Panel
 
--- panel open/close
 local panelOpen=false
 local function OpenP()
     panelOpen=true; Panel.Visible=true; Panel.Size=UDim2.new(0,0,0,0)
@@ -1278,25 +1196,22 @@ local function CloseP()
 end
 Pill.MouseButton1Click:Connect(function() if panelOpen then CloseP() else OpenP() end end)
 
--- UI update 4fps
 local _uiT=0
 local function UpdUI()
     local rdl=RDL.on
-    -- pill color
     if rdl and Parry.on then
-        Pill.BackgroundColor3=Color3.fromRGB(160,30,100); PS2.Color=Color3.fromRGB(240,60,160); Pill.TextColor3=Color3.fromRGB(255,180,230); Pill.Text="◈"
+        Pill.BackgroundColor3=Color3.fromRGB(160,30,100); PS2.Color=Color3.fromRGB(240,60,160); Pill.TextColor3=Color3.fromRGB(255,180,230)
     elseif Parry.on and Lock.on then
-        Pill.BackgroundColor3=Color3.fromRGB(0,120,88); PS2.Color=Color3.fromRGB(0,200,140); Pill.TextColor3=Color3.fromRGB(180,255,220); Pill.Text="◈"
+        Pill.BackgroundColor3=Color3.fromRGB(0,120,88); PS2.Color=Color3.fromRGB(0,200,140); Pill.TextColor3=Color3.fromRGB(180,255,220)
     elseif Parry.on then
-        Pill.BackgroundColor3=Color3.fromRGB(14,100,36); PS2.Color=Color3.fromRGB(22,180,65); Pill.TextColor3=Color3.fromRGB(160,255,160); Pill.Text="◈"
+        Pill.BackgroundColor3=Color3.fromRGB(14,100,36); PS2.Color=Color3.fromRGB(22,180,65); Pill.TextColor3=Color3.fromRGB(160,255,160)
     elseif Lock.on then
-        Pill.BackgroundColor3=Color3.fromRGB(12,60,155); PS2.Color=Color3.fromRGB(22,110,225); Pill.TextColor3=Color3.fromRGB(140,190,255); Pill.Text="◈"
+        Pill.BackgroundColor3=Color3.fromRGB(12,60,155); PS2.Color=Color3.fromRGB(22,110,225); Pill.TextColor3=Color3.fromRGB(140,190,255)
     else
-        Pill.BackgroundColor3=Color3.fromRGB(14,14,14); PS2.Color=Color3.fromRGB(45,45,45); Pill.TextColor3=Color3.fromRGB(140,140,140); Pill.Text="◈"
+        Pill.BackgroundColor3=Color3.fromRGB(14,14,14); PS2.Color=Color3.fromRGB(45,45,45); Pill.TextColor3=Color3.fromRGB(140,140,140)
     end
     if not Panel.Visible then return end
 
-    -- parry chip
     if Parry.on then
         PC.BackgroundColor3=rdl and Color3.fromRGB(120,16,78) or Color3.fromRGB(16,110,42)
         PC.Text=rdl and "PARRY  ⚡RDL" or "PARRY  ON"
@@ -1305,7 +1220,6 @@ local function UpdUI()
         PC.BackgroundColor3=Color3.fromRGB(22,22,22); PC.Text="PARRY  OFF"; PC.TextColor3=Color3.fromRGB(140,140,140)
     end
 
-    -- lock chip
     if not Lock.on then
         LC.BackgroundColor3=Color3.fromRGB(22,22,22); LC.Text="LOCK   OFF"; LC.TextColor3=Color3.fromRGB(140,140,140)
     elseif not Lock.target then
@@ -1316,11 +1230,9 @@ local function UpdUI()
         LC.BackgroundColor3=Color3.fromRGB(14,68,152); LC.Text="LOCK  ACTIVE"; LC.TextColor3=Color3.fromRGB(120,185,255)
     end
 
-    -- info
     Info.Text=string.format("fps:%d  p:%dms  j:%dms  |  P:%d M:%d",
         FPS.v, math.floor(GetPing()), math.floor(GetJitter()), Parry.parryN, Parry.missN)
 
-    -- status
     if CL.active then
         local left=math.max(0,math.floor((CL.lastT+EXCHANGE_TTL-os.clock())*10)/10)
         SL.TextColor3=Color3.fromRGB(60,105,60)
@@ -1330,7 +1242,6 @@ local function UpdUI()
         SL.TextColor3=Color3.fromRGB(40,40,40); SL.Text="idle · neutral"
     end
 
-    -- panel stroke
     PStr.Color=Parry.on and Lock.on and Color3.fromRGB(0,190,135)
         or Parry.on and Color3.fromRGB(16,130,48)
         or Lock.on and Color3.fromRGB(16,88,198)
@@ -1341,34 +1252,28 @@ RunService.RenderStepped:Connect(function()
     local now=os.clock(); if now-_uiT<0.25 then return end; _uiT=now; UpdUI()
 end)
 
--- chip buttons
-PC.MouseButton1Click:Connect(function()
+local function ToggleParry()
     Parry.on=not Parry.on; Parry.nextFire=0; Parry.firing=false; ClearSL(); UpdUI()
-end)
-LC.MouseButton1Click:Connect(function()
+end
+local function ToggleLock()
     Lock.on=not Lock.on
     if not Lock.on then FullOff()
     else
-        -- manual enable: only lock if exchange already live
         if CL.active then
-            local best=GetBest(true); if best then LockOn(best); MarkCombat() end
+            local best=FindAttacker() or GetBest(true)
+            if best then LockOn(best) end
         end
     end
     UpdUI()
-end)
+end
 
--- keybinds
+PC.MouseButton1Click:Connect(ToggleParry)
+LC.MouseButton1Click:Connect(ToggleLock)
+
 UIS.InputBegan:Connect(function(i,g)
     if g then return end
-    if i.KeyCode==Enum.KeyCode.RightShift then
-        Parry.on=not Parry.on; Parry.nextFire=0; Parry.firing=false; ClearSL(); UpdUI()
-    end
-    if i.KeyCode==Enum.KeyCode.RightControl then
-        Lock.on=not Lock.on
-        if not Lock.on then FullOff()
-        else if CL.active then local best=GetBest(true); if best then LockOn(best);MarkCombat() end end end
-        UpdUI()
-    end
+    if i.KeyCode==Enum.KeyCode.RightShift then ToggleParry() end
+    if i.KeyCode==Enum.KeyCode.RightControl then ToggleLock() end
 end)
 
 -- drag pill
@@ -1413,7 +1318,6 @@ end
 
 -- init
 RefreshChar(); SetupHPW()
-if LP.Character then WatchOutgoing(LP.Character) end
 UpdUI()
-print(string.format("[WRAITH v11.0] fps:%d ping:%dms jit:%dms cap:%d | RShift=Parry RCtrl=Lock",
+print(string.format("[WRAITH v11.1] fps:%d ping:%dms jit:%dms cap:%d | RShift=Parry RCtrl=Lock",
     FPS.v, math.floor(GetPing()), math.floor(GetJitter()), DynRL:cap()))
