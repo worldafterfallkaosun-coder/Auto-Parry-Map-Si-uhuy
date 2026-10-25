@@ -1,6 +1,36 @@
 -- ============================================================
---  HIGH SCHOOL ANIME — Combat Tools v11.2 WRAITH
+--  HIGH SCHOOL ANIME — Combat Tools v13.0 WRAITH (hold build)
+--
+--  v13.0 HOLD (patch di atas v12.0):
+--  · HOLD MANAGER: tap lepas-pencet diganti satu block yang DITAHAN
+--    sepanjang jendela hit. Di CombatConfig.BlockState, Set(false)
+--    ngapus timestamp parry (v_u_93[p]=nil) dan ConsumeParry() cuma
+--    lolos kalau block mulai <= window detik sebelum hit. Tap yang
+--    dilepas sebelum hit mendarat = celah = parry hilang = kena.
+--  · RefreshMode: "true" (kirim true berulang) atau "cycle"
+--    (false+true di frame yang sama). Ganti kalau salah satu jelek.
+--  · Overlap: banyak penyerang / combo gak saling ngunci lagi
+--    (spamLock dibuang, jendela digabung).
+--  · FIX ParryFX: event ini di-broadcast ke semua pemain. Dulu parry
+--    pemain lain dihitung sebagai sukses kamu dan ngotorin belajar
+--    lead + hit-delay. Sekarang cuma yang parrier == karaktermu.
+--  · Delay reaksi acak (ReactDelay) dibuang buat jalur non-prediksi.
+--  · Jeda minimal antar request 0.30s -> CFG.RefireGap (0.05s).
+--
+--  HIGH SCHOOL ANIME — Combat Tools v12.0 WRAITH (accuracy build)
 --  (v11.0 by Nono, merged patches v11.1 + v11.2)
+--
+--  v12.0 ACCURACY:
+--  · ADAPTIVE LEAD: bot nyoba beberapa lead (berapa ms sebelum hit
+--    tap pertama dikirim) dan belajar sendiri mana yang bikin parry
+--    sukses (ParryFX) vs kena damage. Gak perlu tau parry window game.
+--  · Hit-delay disimpen ke file (writefile) -> gak mulai dari nol
+--    tiap rejoin. Prediksi aktif dari sampel pertama (CFG.MinSamples).
+--  · Key animasi = Name + AnimationId (gak bentrok kalau nama sama).
+--  · Belajar juga dari pemain lain yang lagi berantem di sekitar.
+--  · Parry tetap jalan pas kamu lagi mukul (CFG.ParryWhileSwinging).
+--  · Burst terprediksi lebih rapat (CFG.PredTaps), rate limiter floor naik.
+--  · WRAITH_DUMP() di console: statistik lead + hit-delay ke clipboard.
 --
 --  v11.2 LOCK (strict, hit-only):
 --  · Lock triggers ONLY from two events, nothing else:
@@ -35,6 +65,34 @@ local PGui   = LP:WaitForChild("PlayerGui")
 
 math.randomseed(math.floor(os.clock() * 1e9) % (2^31 - 1))
 
+local HttpService = game:GetService("HttpService")
+local env = (getgenv and getgenv()) or _G
+if env.__WRAITH12 then warn("[WRAITH] sudah jalan, rejoin dulu kalau mau reload"); return end
+
+-- ============================================================
+--  CONFIG v12
+-- ============================================================
+local CFG = {
+    ParryWhileSwinging = true,   -- true = tetep parry walau lagi mukul (bisa motong combo sendiri)
+    MinSamples      = 1,         -- sampel hit-delay minimal sebelum timing diprediksi
+    PredTaps        = 3,         -- jumlah tap max pas timing udah diprediksi
+    LeadSet         = {0.02, 0.05, 0.08, 0.12, 0.17, 0.23},  -- kandidat lead (detik sebelum hit)
+    LearnFromOthers = true,      -- belajar hit-delay dari pemain lain yang kena hit
+    SaveFile        = "wraith_v12_timing.json",
+    RateFloor       = 8,         -- rate limiter: batas bawah tap/detik
+    RateCeil        = 22,
+    RateStart       = 14,
+
+    -- v13 HOLD
+    HoldRefresh     = true,      -- true = refresh block selama jendela; false = pencet sekali lalu tahan
+    RefreshMode     = "true",    -- "true" = FireServer(true) berulang | "cycle" = false+true di frame sama
+    HoldTail        = 0.14,      -- tahan segini lama setelah prediksi hit (detik)
+    HoldUnknown     = 0.42,      -- durasi tahan kalau hit-delay animasi belum dipelajari
+    HoldHeavy       = 0.60,      -- sama, buat serangan heavy
+    HoldRagdoll     = 0.32,      -- sama, pas ragdoll
+    RefireGap       = 0.05,      -- jeda minimal antar request parry (dulu 0.30)
+}
+
 -- ============================================================
 --  REMOTES
 -- ============================================================
@@ -52,6 +110,7 @@ local KickComboFX   = WR("KickComboFX")
 local HeavyPunchFX  = WR("HeavyPunchFX")
 
 if not RequestBlock then warn("[WRAITH] RequestBlock missing"); return end
+env.__WRAITH12 = true
 
 -- ============================================================
 --  NAME ROTATION
@@ -209,9 +268,43 @@ local function gamma(k, th)
 end
 
 -- ============================================================
---  RATE LIMITER — ceiling 20, probe every 14s
+--  ADAPTIVE LEAD — Thompson sampling over CFG.LeadSet
+--  Tiap burst terprediksi milih satu lead. Hasilnya (parry sukses /
+--  kena damage) dilaporin balik, jadi lead yang paling sering sukses
+--  makin sering dipilih. Statistik diluruhkan pelan biar tetep adaptif.
 -- ============================================================
-local DynRL = { floor=5, ceil=20, cur=10, probeT=0, pCd=14, hit=false, hb=false }
+local Lead = { a = {}, b = {}, n = 0 }
+for i = 1, #CFG.LeadSet do Lead.a[i] = 1; Lead.b[i] = 1 end
+
+local function betaSample(a, b)
+    local x = gamma(math.max(a, 1), 1)
+    local y = gamma(math.max(b, 1), 1)
+    return x / (x + y)
+end
+
+function Lead:pick()
+    local best, bi = -1, 1
+    for i = 1, #CFG.LeadSet do
+        local s = betaSample(self.a[i], self.b[i])
+        if s > best then best, bi = s, i end
+    end
+    return bi, CFG.LeadSet[bi]
+end
+
+function Lead:report(i, ok)
+    if not i or not self.a[i] then return end
+    for j = 1, #CFG.LeadSet do
+        self.a[j] = 1 + (self.a[j] - 1) * 0.985
+        self.b[j] = 1 + (self.b[j] - 1) * 0.985
+    end
+    if ok then self.a[i] = self.a[i] + 1 else self.b[i] = self.b[i] + 1 end
+    self.n = self.n + 1
+end
+
+-- ============================================================
+--  RATE LIMITER — floor/ceil dari CFG, probe every 14s
+-- ============================================================
+local DynRL = { floor=CFG.RateFloor, ceil=CFG.RateCeil, cur=CFG.RateStart, probeT=0, pCd=14, hit=false, hb=false }
 function DynRL:probe()
     local now = os.clock()
     if now - self.probeT < self.pCd then return end
@@ -274,6 +367,7 @@ local ACT_PRI = {
 --  Fed by: my HP drops (failed/no parry) and ParryFX (success).
 -- ============================================================
 local HD = {}
+local _dirty = false
 local function LearnDelay(name, obs)
     if not name or not obs or obs < 0.03 or obs > 0.90 then return end
     local e = HD[name]
@@ -281,10 +375,52 @@ local function LearnDelay(name, obs)
         HD[name] = {d = obs, n = 1}
     else
         if e.n >= 3 and math.abs(obs - e.d) > 0.22 then return end -- outlier (combo chain etc.)
-        e.d = e.d * 0.65 + obs * 0.35
-        e.n = e.n + 1
+        if e.n < 3 and math.abs(obs - e.d) > 0.40 then return end
+        local w = (e.n < 3) and 0.50 or 0.35
+        e.d = e.d * (1 - w) + obs * w
+        e.n = math.min(e.n + 1, 50)
+    end
+    _dirty = true
+end
+
+-- ============================================================
+--  PERSISTENCE — hit-delay + statistik lead disimpen ke file
+-- ============================================================
+local _saveT = 0
+local function HDLoad()
+    if not (readfile and isfile) then return end
+    local ok, data = pcall(function()
+        if not isfile(CFG.SaveFile) then return nil end
+        return HttpService:JSONDecode(readfile(CFG.SaveFile))
+    end)
+    if not ok or type(data) ~= "table" then return end
+    if type(data.hd) == "table" then
+        for name, e in pairs(data.hd) do
+            if type(name) == "string" and type(e) == "table" and tonumber(e.d) and tonumber(e.n) then
+                HD[name] = { d = tonumber(e.d), n = math.clamp(math.floor(tonumber(e.n)), 1, 50) }
+            end
+        end
+    end
+    local L = data.lead
+    if type(L) == "table" and type(L.a) == "table" and type(L.b) == "table"
+       and #L.a == #CFG.LeadSet and #L.b == #CFG.LeadSet then
+        for i = 1, #CFG.LeadSet do
+            Lead.a[i] = math.max(1, tonumber(L.a[i]) or 1)
+            Lead.b[i] = math.max(1, tonumber(L.b[i]) or 1)
+        end
+        Lead.n = tonumber(L.n) or 0
     end
 end
+local function HDSave(force)
+    if not writefile or not _dirty then return end
+    local now = os.clock()
+    if not force and now - _saveT < 20 then return end
+    _saveT = now; _dirty = false
+    pcall(function()
+        writefile(CFG.SaveFile, HttpService:JSONEncode({ hd = HD, lead = { a = Lead.a, b = Lead.b, n = Lead.n } }))
+    end)
+end
+HDLoad()
 
 -- ============================================================
 --  CHAR
@@ -373,6 +509,48 @@ local Parry = {
 }
 
 -- ============================================================
+--  OUTCOME TRACKING — feeds the adaptive lead
+--  Pending = burst terprediksi yang nunggu hasil (ParryFX / HP drop)
+-- ============================================================
+local Pend, Stat, _lastFailT = {}, {ok=0, fail=0}, 0
+local function PendAdd(i, H, name) Pend[#Pend+1] = {i=i, H=H, name=name} end
+local function PendFor(name, H)
+    for _, p in ipairs(Pend) do
+        if p.name == name and math.abs(p.H - H) < 0.20 then return p end
+    end
+    return nil
+end
+local function PendResolve(ok)
+    local now = os.clock()
+    for k = #Pend, 1, -1 do if now - Pend[k].H > 0.8 then table.remove(Pend, k) end end
+    local bk, bd = nil, 0.50
+    for k, p in ipairs(Pend) do
+        local d = math.abs(now - p.H)
+        if d < bd then bd, bk = d, k end
+    end
+    if not bk then return end
+    local p = table.remove(Pend, bk)
+    Lead:report(p.i, ok)
+    if ok then Stat.ok = Stat.ok + 1 else Stat.fail = Stat.fail + 1 end
+    _dirty = true
+    if Lead.n % 10 == 0 then
+        local bi, bm = 1, -1
+        for i = 1, #CFG.LeadSet do
+            local m = Lead.a[i] / (Lead.a[i] + Lead.b[i])
+            if m > bm then bm, bi = m, i end
+        end
+        print(string.format("[WRAITH] %d hasil | sukses %d / gagal %d | lead terbaik %.2fs (%.0f%%)",
+            Lead.n, Stat.ok, Stat.fail, CFG.LeadSet[bi], bm * 100))
+    end
+end
+local function PendFail()
+    local now = os.clock()
+    if now - _lastFailT < 0.15 then return end
+    _lastFailT = now
+    PendResolve(false)
+end
+
+-- ============================================================
 --  LOCK CONFIG
 -- ============================================================
 local LCFG = {
@@ -444,6 +622,7 @@ end
 -- ============================================================
 local function Dist(a,b) if not a or not b then return 9999 end return (a.Position-b.Position).Magnitude end
 local function IsSelfAtk()
+    if CFG.ParryWhileSwinging then return false end
     local c=MC.char; local h=MC.hum; if not c then return false end
     for _,a in ipairs(SELF_ATKS) do
         if c:GetAttribute(a)==true then return true end
@@ -502,6 +681,31 @@ local function FindAttacker()
         end
     end
     return best
+end
+
+-- v12: learn an animation's hit delay from OTHER players getting hit
+local function LearnFromVictim(vp, vc)
+    local vr = vc and vc:FindFirstChild("HumanoidRootPart")
+    if not vr or not MC.root then return end
+    if (vr.Position - MC.root.Position).Magnitude > 60 then return end
+    local now = os.clock()
+    if now - lastSelfAtkT < 0.60 then return end          -- itu hit-ku sendiri
+    local best, bestAge = nil, 0.90
+    for _, ap in ipairs(Players:GetPlayers()) do
+        if ap ~= vp and ap ~= LP then
+            local aps = PS[ap.UserId]
+            local ar  = ap.Character and ap.Character:FindFirstChild("HumanoidRootPart")
+            if aps and aps.animName and not aps.animHit and ar then
+                local age = now - aps.animT
+                local toV = vr.Position - ar.Position
+                if age > 0.04 and age < bestAge and toV.Magnitude <= LCFG.HitRange and toV.Magnitude > 0.1
+                   and ar.CFrame.LookVector:Dot(toV.Unit) > 0.35 then
+                    best, bestAge = aps, age
+                end
+            end
+        end
+    end
+    if best then best.animHit = true; LearnDelay(best.animName, bestAge) end
 end
 
 -- does this player look like they're attacking right now? (parry gate)
@@ -605,89 +809,143 @@ end
 Decoy:sch(); Decoy:schS()
 
 -- ============================================================
---  RAW PARRY — single press+release
+--  HOLD MANAGER (v13)
+--  Satu block ditahan selama jendela hit, bukan tap-lepas-tap.
+--  win = daftar {s=mulai, e=selesai} (os.clock). Loop per-frame
+--  nahan/refresh block selama ada jendela aktif, lepas kalau habis.
 -- ============================================================
-local function RawParry(tap, urg)
-    if not RL:ok() then return false end
-    local jPre  = 0.001 + math.random()*0.011
-    local jPost = 0.001 + math.random()*0.008
-    pcall(function()
-        task.wait(jPre)
-        RequestBlock:FireServer(true); RL:mark()
-        task.wait(tap)
-        task.wait(jPost)
-        RequestBlock:FireServer(false)
+local Hold = { win = {}, loop = false, down = false, lastTrue = 0 }
+
+local function HoldRelease()
+    if not Hold.down then return end
+    Hold.down = false
+    pcall(function() RequestBlock:FireServer(false) end)
+end
+
+local function HoldInterval()
+    local cap = math.max(DynRL:cap(), 4)
+    return math.max(0.040, 1 / (cap * 0.85))
+end
+
+local function HoldActive(now)
+    local act = false
+    for k = #Hold.win, 1, -1 do
+        local w = Hold.win[k]
+        if now >= w.e then
+            table.remove(Hold.win, k)
+        elseif now >= w.s then
+            act = true
+        end
+    end
+    return act
+end
+
+local function HoldSend()
+    if CFG.RefreshMode == "cycle" and Hold.down then
+        pcall(function()
+            RequestBlock:FireServer(false)
+            RequestBlock:FireServer(true)
+        end)
+        RL:mark(); RL:mark()
+    else
+        pcall(function() RequestBlock:FireServer(true) end)
+        RL:mark()
+    end
+    Hold.lastTrue = os.clock()
+    Hold.down = true
+end
+
+local function HoldLoop()
+    if Hold.loop then return end
+    Hold.loop = true
+    task.spawn(function()
+        while #Hold.win > 0 do
+            if not (Parry.on or Parry.reactMode or RDL.on) then
+                Hold.win = {}
+                break
+            end
+            local now = os.clock()
+            local act = HoldActive(now)
+            local char = LP.Character
+            local broken = char and char:GetAttribute("GuardBroken") == true
+            if act and not broken then
+                local gap = 0
+                if Hold.down then gap = CFG.HoldRefresh and HoldInterval() or 9e9 end
+                if now - Hold.lastTrue >= gap and RL:ok() then
+                    HoldSend()
+                end
+            elseif Hold.down and #Hold.win > 0 and not act then
+                -- jeda antar dua jendela: lepas kalau jendela berikutnya masih jauh
+                local nextS = math.huge
+                for _, w in ipairs(Hold.win) do
+                    if w.s < nextS then nextS = w.s end
+                end
+                if nextS - now > 0.20 then HoldRelease() end
+            end
+            task.wait()
+        end
+        HoldRelease()
+        Hold.loop = false
     end)
-    return true
+end
+
+local function HoldRequest(s, e)
+    for _, w in ipairs(Hold.win) do
+        if math.abs(w.s - s) < 0.010 and math.abs(w.e - e) < 0.010 then return end
+    end
+    Hold.win[#Hold.win + 1] = { s = s, e = e }
+    HoldLoop()
+end
+
+-- parry sukses: buang jendela yang lagi aktif/sudah mulai, sisakan yang di masa depan
+local function HoldParried()
+    local now = os.clock()
+    for k = #Hold.win, 1, -1 do
+        if Hold.win[k].s <= now + 0.05 then table.remove(Hold.win, k) end
+    end
 end
 
 -- ============================================================
---  SPAM LOCK
+--  SPAM LOCK (dipertahankan buat kompatibilitas; DoBurst gak pakai lagi)
 -- ============================================================
 local spamLock=false; local spamLockT=0
 local function ClearSL() spamLock=false; spamLockT=0 end
 
 -- ============================================================
---  DO BURST — core
---  If the animation's hit delay has been learned (n>=2), the tap
---  cluster is scheduled to land right before the predicted hit:
---      send = animStart + hitDelay - RTT - 40ms
---  Otherwise: old behaviour (fast reaction + gamma-spaced taps).
+--  DO BURST (v13) — jadwalin jendela hold
+--  Prediksi ada (hit-delay udah dipelajari):
+--      mulai  = animStart + hitDelay - RTT - lead(Thompson)
+--      selesai = animStart + hitDelay + HoldTail
+--  Belum ada: mulai sekarang, tahan HoldUnknown/HoldHeavy/HoldRagdoll.
 -- ============================================================
 local function DoBurst(heavy, urg, track, ovr, name, t0)
-    if spamLock and os.clock()-spamLockT>0.48 then ClearSL() end
-    local isRDL = RDL.on or urg=="ragdoll"
-    local isFst = urg=="instant" or urg=="prearm" or isRDL
-    if spamLock and not isFst then return end
-    spamLock=true; spamLockT=os.clock()
+    local isRDL = RDL.on or urg == "ragdoll"
+    local now   = os.clock()
+    local hd    = name and HD[name]
+    local predicted = (not isRDL and hd and hd.n >= CFG.MinSamples and t0) and (t0 + hd.d) or nil
 
-    local lead  = PingLead()
-    local bcap  = math.floor(DynRL:cap()*(isRDL and 0.90 or 0.72))
-    local count = ovr or BurstCount(heavy, urg, bcap)
-    count = math.max(count, 2)
-
-    local hd = name and HD[name]
-    local predicted = (not isRDL and hd and hd.n >= 2 and t0) and (t0 + hd.d) or nil
-
-    task.spawn(function()
-        local react
-        if predicted then
-            local sendT = predicted - GetPing()/1000 - 0.040
-            react = math.clamp(sendT - os.clock(), 0.002, 0.60)
-            Parry.nextFire = math.max(Parry.nextFire, os.clock() + 0.22)
+    local s, e
+    if predicted then
+        local leadV = 0.04
+        local pend = PendFor(name, predicted)
+        if pend then
+            leadV = CFG.LeadSet[pend.i] or leadV
         else
-            react = ReactDelay(heavy, urg)
-            if track and not isFst then
-                local ok,dur=pcall(function() return track.Length end)
-                if ok and dur and dur>0 then
-                    local ahead = math.max(0,(dur*0.18 - track.TimePosition)/math.max(track.Speed,0.01))
-                    if ahead>0.004 and ahead<react then react=math.max(0.005, react-ahead) end
-                end
-            end
-            react = math.max(0.004, react - lead)
+            local li, lv = Lead:pick()
+            leadV = lv
+            PendAdd(li, predicted, name)
         end
-        task.wait(react)
+        s = predicted - GetPing() / 1000 - leadV
+        e = predicted + CFG.HoldTail
+        Parry.nextFire = math.max(Parry.nextFire, now + CFG.RefireGap)
+    else
+        local dur = isRDL and CFG.HoldRagdoll or (heavy and CFG.HoldHeavy or CFG.HoldUnknown)
+        s = now + 0.004
+        e = s + dur
+    end
 
-        for i=1,count do
-            if not (Parry.on or Parry.reactMode or isRDL) then break end
-            if not RL:ok() then
-                if isRDL then continue end
-                task.wait(gamma(1.4, 0.048))
-            end
-            RawParry(TapDuration(urg), urg)
-            if i < count then
-                if predicted then
-                    task.wait(0.026 + math.random()*0.016)
-                else
-                    local sc = isRDL and 0.013 or 0.024
-                    local iv = gamma(isRDL and 1.0 or (1.2+(i/count)*0.5), sc)
-                    task.wait(math.clamp(iv, isRDL and 0.006 or 0.010, 0.068))
-                end
-            end
-        end
-
-        if isRDL then task.delay(0.065,ClearSL) else ClearSL() end
-    end)
+    HoldRequest(math.max(s, now + 0.002), math.max(e, now + 0.05))
+    if isRDL then task.delay(0.065, ClearSL) else ClearSL() end
 end
 
 -- ============================================================
@@ -702,7 +960,7 @@ local function CanFire(ps, urg)
     end
     if urg=="reactive" then return MC.root~=nil and not IsSelfAtk() end
     if not Parry.on then return false end
-    if Parry.firing and os.clock()-Parry.fireAt<0.30 then return false end
+    if Parry.firing and os.clock()-Parry.fireAt<CFG.RefireGap then return false end
     if os.clock()<Parry.nextFire then return false end
     if not MC.root then return false end
     if IsSelfAtk() then return false end
@@ -836,6 +1094,9 @@ local function WatchChar(p, char)
                 local ok,n=pcall(function() return track.Animation.Name end)
                 if not ok or not n then return end
                 if isReactAnim(n) then return end
+                local aid=""
+                pcall(function() aid=tostring(track.Animation.AnimationId):match("%d+") or "" end)
+                local key=(aid~="") and (n.."#"..aid) or n
                 local H=isM2(n); local M=isM1(n)
                 local isAct=false
                 pcall(function() isAct = (ACT_PRI[track.Priority]==true) and (not track.Looped) end)
@@ -844,7 +1105,7 @@ local function WatchChar(p, char)
                 -- attack evidence (before parry gates, so lock attribution works with parry off)
                 local gps=GPS(uid)
                 local now=os.clock()
-                gps.atkT=now; gps.animName=n; gps.animT=now; gps.animHit=false
+                gps.atkT=now; gps.animName=key; gps.animT=now; gps.animHit=false
 
                 if not (Parry.on or Parry.reactMode) then return end
                 if not RDL.on and IsSelfAtk() then return end
@@ -859,18 +1120,18 @@ local function WatchChar(p, char)
                 if H then ps.heavyAlert=true; ps.heavyAlertExp=now+4.0 end
 
                 -- learned timing available -> single timed burst
-                local hd=HD[n]
-                if hd and hd.n>=2 then
-                    FQ:push(RDL.on and "ragdoll" or "prearm", H, track, n, now)
+                local hd=HD[key]
+                if hd and hd.n>=CFG.MinSamples then
+                    FQ:push(RDL.on and "ragdoll" or "prearm", H, track, key, now)
                     return
                 end
 
                 -- default path (no timing data yet)
                 if track.TimePosition<=0.020 then TryPreArm(ps,uid,n,H,now) end
                 if H then
-                    FQ:push(RDL.on and "ragdoll" or "instant", true, nil, n, now)
+                    FQ:push(RDL.on and "ragdoll" or "instant", true, nil, key, now)
                 else
-                    FQ:push(RDL.on and "ragdoll" or "normal", false, track, n, now)
+                    FQ:push(RDL.on and "ragdoll" or "normal", false, track, key, now)
                 end
             end)
         end)
@@ -923,6 +1184,7 @@ local function WatchChar(p, char)
             local drop = ph - h
             ph = h
             if drop < 0.5 then return end
+            if CFG.LearnFromOthers then pcall(LearnFromVictim, p, char) end
             if os.clock() - lastSelfAtkT > 0.60 + GetPing()/1000 then return end
             local er = char:FindFirstChild("HumanoidRootPart")
             if not er or not MC.root then return end
@@ -1009,8 +1271,11 @@ if GuardBreakFX then GuardBreakFX.OnClientEvent:Connect(function()
 end) end
 
 -- successful parry -> learn that animation's hit delay
-if ParryFX then ParryFX.OnClientEvent:Connect(function()
-    MarkCombat(); Parry.parryN=Parry.parryN+1; UpdateThr(false,nil); ClearSL()
+if ParryFX then ParryFX.OnClientEvent:Connect(function(_, parrier)
+    -- v13: ParryFX di-broadcast ke semua pemain; cuma hitung kalau akulah parrier
+    if parrier ~= nil and parrier ~= LP.Character then return end
+    MarkCombat(); Parry.parryN=Parry.parryN+1; UpdateThr(false,nil); ClearSL(); PendResolve(true)
+    HoldParried()
     local now=os.clock(); local root=MC.root
     local bestPs, bestAge = nil, 9
     for _,p in ipairs(Players:GetPlayers()) do
@@ -1213,7 +1478,7 @@ local function HookSelf(char)
             local drop=prevHP-cur
             prevHP=cur
             if drop < 0.5 then return end
-            MarkCombat()
+            MarkCombat(); PendFail()
             local t=FindAttacker()
             if t then
                 local ps=GPS(t.UserId)
@@ -1277,7 +1542,7 @@ local DHL=Instance.new("TextLabel"); DHL.Size=UDim2.new(1,-6,1,0)
 DHL.Position=UDim2.new(0,6,0,0); DHL.BackgroundTransparency=1
 DHL.TextColor3=Color3.fromRGB(55,55,55); DHL.TextSize=8
 DHL.Font=Enum.Font.GothamBold; DHL.TextXAlignment=Enum.TextXAlignment.Left
-DHL.Text="WRAITH v11.2"; DHL.Parent=DH
+DHL.Text="WRAITH v12.0"; DHL.Parent=DH
 
 local function Chip(txt,y)
     local b=Instance.new("TextButton")
@@ -1322,7 +1587,7 @@ end
 Pill.MouseButton1Click:Connect(function() if panelOpen then CloseP() else OpenP() end end)
 
 local function LearnedCount()
-    local n=0; for _,e in pairs(HD) do if e.n>=2 then n=n+1 end end
+    local n=0; for _,e in pairs(HD) do if e.n>=CFG.MinSamples then n=n+1 end end
     return n
 end
 
@@ -1360,8 +1625,10 @@ local function UpdUI()
         LC.BackgroundColor3=Color3.fromRGB(14,68,152); LC.Text="LOCK  ACTIVE"; LC.TextColor3=Color3.fromRGB(120,185,255)
     end
 
-    Info.Text=string.format("fps:%d p:%dms j:%d | P:%d M:%d L:%d",
-        FPS.v, math.floor(GetPing()), math.floor(GetJitter()), Parry.parryN, Parry.missN, LearnedCount())
+    local tot=Stat.ok+Stat.fail
+    local wr=tot>0 and math.floor(Stat.ok/tot*100) or 0
+    Info.Text=string.format("p:%dms P:%d M:%d L:%d W:%d%%",
+        math.floor(GetPing()), Parry.parryN, Parry.missN, LearnedCount(), wr)
 
     if CL.active then
         local left=math.max(0,math.floor((CL.lastT+EXCHANGE_TTL-os.clock())*10)/10)
@@ -1444,5 +1711,26 @@ end
 -- init
 RefreshChar()
 UpdUI()
-print(string.format("[WRAITH v11.2] fps:%d ping:%dms jit:%dms cap:%d | RShift=Parry RCtrl=Lock",
+print(string.format("[WRAITH v12.0] fps:%d ping:%dms jit:%dms cap:%d | RShift=Parry RCtrl=Lock",
     FPS.v, math.floor(GetPing()), math.floor(GetJitter()), DynRL:cap()))
+
+-- v12: statistik buat tuning (jalanin WRAITH_DUMP() dari executor)
+env.WRAITH_DUMP = function()
+    local lines = { string.format("sukses=%d gagal=%d hasil=%d", Stat.ok, Stat.fail, Lead.n) }
+    for i, v in ipairs(CFG.LeadSet) do
+        lines[#lines+1] = string.format("lead %.2f  a=%.1f b=%.1f  mean=%.2f",
+            v, Lead.a[i], Lead.b[i], Lead.a[i] / (Lead.a[i] + Lead.b[i]))
+    end
+    for k, e in pairs(HD) do lines[#lines+1] = string.format("HD %s d=%.3f n=%d", k, e.d, e.n) end
+    local s = table.concat(lines, "\n")
+    if setclipboard then pcall(setclipboard, s) end
+    print(s)
+    return s
+end
+
+task.spawn(function()
+    while env.__WRAITH12 do
+        task.wait(25)
+        HDSave(true)
+    end
+end)
