@@ -1,4 +1,17 @@
 -- ============================================================
+--  HIGH SCHOOL ANIME — Combat Tools v13.4 WRAITH (attack-tagged guard log)
+--
+--  v13.4 (patch di atas v13.3):
+--  · GUARD LOG sekarang nyebut SERANGAN di balik tiap drop guard:
+--      [GUARD] 0.93 -> 0.49 (-0.44) parry | hold=true sends=3 prev=11 win=2 | atk=NamaAnim|H|pred|0.31s
+--    atk = nama animasi | H (heavy) atau L (light) | pred (timing udah
+--    dipelajari) atau unk | umur request (detik sebelum guard turun).
+--    kind = "parry" kalau ParryFX-mu nyala <=0.15s dari drop, selain itu "other"
+--    (kena hit / block biasa).
+--  · JENDELA GAK NUMPUK: request yang sama (hit sama / animasi sama yang
+--    overlap) digabung jadi satu jendela, bukan nambah entri baru tiap
+--    heartbeat (win sebelumnya bisa sampai 11).
+--
 --  HIGH SCHOOL ANIME — Combat Tools v13.3 WRAITH (single-press on learned timing)
 --
 --  v13.3 (patch di atas v13.2):
@@ -853,7 +866,7 @@ Decoy:sch(); Decoy:schS()
 --  win = daftar {s=mulai, e=selesai} (os.clock). Loop per-frame
 --  nahan/refresh block selama ada jendela aktif, lepas kalau habis.
 -- ============================================================
-local Hold = { win = {}, loop = false, down = false, lastTrue = 0, sent = 0, lastSent = 0 }
+local Hold = { win = {}, loop = false, down = false, lastTrue = 0, sent = 0, lastSent = 0, hist = {}, parryT = 0 }
 
 local function HoldRelease()
     if not Hold.down then return end
@@ -948,8 +961,17 @@ local function HoldLoop()
 end
 
 local function HoldRequest(s, e, unk, hit)
+    -- gabung ke jendela yang udah ada kalau itu hit/animasi yang sama
     for _, w in ipairs(Hold.win) do
-        if math.abs(w.s - s) < 0.010 and math.abs(w.e - e) < 0.010 then return end
+        if hit and w.h then
+            if math.abs(w.h - hit) < 0.05 then          -- hit yang sama, diminta ulang
+                w.s = math.min(w.s, s); w.e = math.max(w.e, e)
+                return
+            end
+        elseif (not hit) and (not w.h) and w.u == unk and s <= w.e and e >= w.s then
+            w.s = math.min(w.s, s); w.e = math.max(w.e, e)   -- jendela tanpa timing yang overlap
+            return
+        end
     end
     Hold.win[#Hold.win + 1] = { s = s, e = e, u = unk, h = hit }
     HoldLoop()
@@ -958,9 +980,36 @@ end
 -- parry sukses: buang jendela yang lagi aktif/sudah mulai, sisakan yang di masa depan
 local function HoldParried()
     local now = os.clock()
+    Hold.parryT = now
     for k = #Hold.win, 1, -1 do
         if Hold.win[k].s <= now + 0.05 then table.remove(Hold.win, k) end
     end
+end
+
+-- ============================================================
+--  ATTACK TAG (v13.4) — catatan request parry terakhir buat guard log
+-- ============================================================
+local function HoldNote(name, heavy, urg, pred)
+    local h = Hold.hist
+    local nm = name or ("(" .. tostring(urg) .. ")")
+    local last = h[#h]
+    if last and last.n == nm and os.clock() - last.t < 0.25 then return end
+    h[#h + 1] = { t = os.clock(), n = nm, H = heavy, p = pred }
+    if #h > 8 then table.remove(h, 1) end
+end
+
+local function AtkTag()
+    local now = os.clock()
+    local out = {}
+    for i = #Hold.hist, 1, -1 do
+        local r = Hold.hist[i]
+        local age = now - r.t
+        if age > 1.0 or #out >= 3 then break end
+        out[#out + 1] = string.format("%s|%s|%s|%.2fs",
+            string.sub(tostring(r.n), 1, 24), r.H and "H" or "L", r.p and "pred" or "unk", age)
+    end
+    if #out == 0 then return "-" end
+    return table.concat(out, " ; ")
 end
 
 -- ============================================================
@@ -974,8 +1023,13 @@ local function GuardLogHook(char)
         local v = char:GetAttribute("GuardValue")
         if typeof(v) ~= "number" then return end
         if v < last - 0.005 then
-            print(string.format("[GUARD] %.2f -> %.2f (-%.2f) | hold=%s sends=%d prev=%d win=%d",
-                last, v, last - v, tostring(Hold.down), Hold.sent, Hold.lastSent, #Hold.win))
+            local t0, from, to = os.clock(), last, v
+            local hold, sent, prev, win, atk = Hold.down, Hold.sent, Hold.lastSent, #Hold.win, AtkTag()
+            task.delay(0.15, function()
+                local kind = (math.abs(Hold.parryT - t0) <= 0.15) and "parry" or "other"
+                print(string.format("[GUARD] %.2f -> %.2f (-%.2f) %s | hold=%s sends=%d prev=%d win=%d | atk=%s",
+                    from, to, from - to, kind, tostring(hold), sent, prev, win, atk))
+            end)
         end
         last = v
     end)
@@ -1001,6 +1055,7 @@ local function DoBurst(heavy, urg, track, ovr, name, t0)
     local now   = os.clock()
     local hd    = name and HD[name]
     local predicted = (not isRDL and hd and hd.n >= CFG.MinSamples and t0) and (t0 + hd.d) or nil
+    HoldNote(name, heavy, urg, predicted ~= nil)
 
     local s, e
     if predicted then
