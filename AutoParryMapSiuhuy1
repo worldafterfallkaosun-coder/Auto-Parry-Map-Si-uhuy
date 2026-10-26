@@ -1,4 +1,14 @@
 -- ============================================================
+--  HIGH SCHOOL ANIME — Combat Tools v13.3 WRAITH (single-press on learned timing)
+--
+--  v13.3 (patch di atas v13.2):
+--  · Jendela dengan timing yang SUDAH dipelajari sekarang pencet block
+--    SEKALI di waktu yang pas lalu ditahan (CFG.PredRefresh = 0), persis
+--    kayak parry manual. Refresh di sini gak ada gunanya: kiriman yang
+--    nyampe server sesudah hit bisa nge-arm ulang timestamp parry dan
+--    (dugaan) bikin guard kepotong 2x (50 vs 26 manual).
+--  · Refresh (CFG.RefreshMax) cuma buat animasi yang belum dipelajari.
+--
 --  HIGH SCHOOL ANIME — Combat Tools v13.2 WRAITH (hold + eco + guard-aware)
 --
 --  v13.2 (patch di atas v13.1):
@@ -115,7 +125,8 @@ local CFG = {
     HoldHeavy       = 0.45,      -- sama, buat serangan heavy [dulu 0.60]
     EcoSkipLow      = true,      -- hemat guard: lewati/putus hold animasi yang belum dipelajari kalau guard rendah
     EcoGuardLow     = 0.35,      -- batas GuardValue (0..1) buat mode hemat [v13.2: dulu 0.25]
-    RefreshMax      = 2,         -- refresh maksimal per jendela hit setelah pencet pertama (0 = pencet sekali)
+    RefreshMax      = 2,         -- refresh maksimal per jendela (animasi BELUM dipelajari) setelah pencet pertama
+    PredRefresh     = 0,         -- refresh maksimal per jendela yang timing-nya SUDAH dipelajari (0 = pencet sekali)
     GuardLog        = true,      -- print tiap GuardValue turun (buat tuning)
     HoldRagdoll     = 0.32,      -- sama, pas ragdoll
     RefireGap       = 0.05,      -- jeda minimal antar request parry (dulu 0.30)
@@ -894,7 +905,8 @@ end
 local function HoldWants(now)
     if not Hold.down then return true end
     for _, w in ipairs(Hold.win) do
-        if now >= w.s and now < w.e and (w.n or 0) < CFG.RefreshMax + 1 then return true end
+        local cap = (w.h and CFG.PredRefresh or CFG.RefreshMax) + 1
+        if now >= w.s and now < w.e and (w.n or 0) < cap then return true end
     end
     return false
 end
@@ -935,11 +947,11 @@ local function HoldLoop()
     end)
 end
 
-local function HoldRequest(s, e, unk)
+local function HoldRequest(s, e, unk, hit)
     for _, w in ipairs(Hold.win) do
         if math.abs(w.s - s) < 0.010 and math.abs(w.e - e) < 0.010 then return end
     end
-    Hold.win[#Hold.win + 1] = { s = s, e = e, u = unk }
+    Hold.win[#Hold.win + 1] = { s = s, e = e, u = unk, h = hit }
     HoldLoop()
 end
 
@@ -1018,7 +1030,7 @@ local function DoBurst(heavy, urg, track, ovr, name, t0)
         e = s + dur
     end
 
-    HoldRequest(math.max(s, now + 0.002), math.max(e, now + 0.05), (not predicted) and (not isRDL))
+    HoldRequest(math.max(s, now + 0.002), math.max(e, now + 0.05), (not predicted) and (not isRDL), predicted)
     if isRDL then task.delay(0.065, ClearSL) else ClearSL() end
 end
 
